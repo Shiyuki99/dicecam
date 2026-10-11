@@ -127,7 +127,7 @@ function classifyCameraError(e: unknown): PermissionErrorInfo {
         kind: "busy",
         title: "Camera is busy",
         message:
-          "Your camera/mic is in use by another app or tab. Close it, then try again.",
+          "The camera couldn't be started — usually another tab or app is holding it (a second DiceCam tab, Zoom, Teams, Discord, OBS), or the OS is blocking this browser. Close the other app/tab, check OS camera privacy settings, then try again.",
         canReprompt: true,
       };
     default:
@@ -1293,10 +1293,13 @@ export function useRandomChat() {
           "AbortError",
         ]);
         if (err?.__permKind || (err?.name && permNames.has(err.name))) {
-          console.warn(
-            "camera failed:",
-            err?.name || err?.code || err?.message || err
-          );
+          // Full detail (name + message + constraint) — the name alone
+          // can't distinguish "locked by another app" from driver failure.
+          console.warn("camera failed:", {
+            name: (err as DOMException)?.name,
+            message: (err as Error)?.message,
+            constraint: (err as unknown as OverconstrainedError)?.constraint,
+          });
           hangUp({ keepCamera: false });
           setStatus("idle");
           let info = classifyCameraError(e);

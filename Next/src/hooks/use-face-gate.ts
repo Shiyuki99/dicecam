@@ -63,6 +63,9 @@ interface FaceGateOpts {
 /**
  * One-shot face check against a stream. true = face visible, false = none,
  * null = detector unavailable (fail open so calls still work offline).
+ *
+ * Waits for real frames first (fresh grants need warm-up) and samples a few
+ * frames: any positive allows. A single blind frame must never decide.
  */
 export async function checkFaceOnce(
   stream: MediaStream
@@ -77,12 +80,37 @@ export async function checkFaceOnce(
   video.muted = true;
   (video as HTMLVideoElement & { playsInline?: boolean }).playsInline = true;
   video.srcObject = stream;
+  const sleep = (ms: number) =>
+    new Promise<void>((resolve) => setTimeout(resolve, ms));
   try {
-    await video.play();
-    if (video.readyState < 2 || video.videoWidth === 0) return null;
-    return (
-      detector.detectForVideo(video, performance.now()).detections.length > 0
-    );
+    await video.play().catch(() => {});
+    // Wait for actual frames — up to ~4s. A fresh camera has none yet and
+    // must not be mistaken for "no face" (or fail-open as "ready").
+    let ready = false;
+    for (let i = 0; i < 20; i += 1) {
+      if (video.readyState >= 2 && video.videoWidth > 0) {
+        ready = true;
+        break;
+      }
+      await sleep(200);
+    }
+    if (!ready) return null;
+    // Sample up to 3 frames ~400ms apart; any face counts. Guards against
+    // one bad frame wrongly blocking (or wrongly allowing) the camera.
+    for (let i = 0; i < 3; i += 1) {
+      if (i > 0) await sleep(400);
+      try {
+        if (
+          detector.detectForVideo(video, performance.now()).detections.length >
+          0
+        ) {
+          return true;
+        }
+      } catch {
+        return null;
+      }
+    }
+    return false;
   } catch {
     return null;
   } finally {
