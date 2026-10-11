@@ -6,9 +6,15 @@ import {
   addDoc,
   getDocs,
   onSnapshot,
-  updateDoc,
   deleteDoc,
+  query,
+  where,
+  limit,
+  runTransaction,
+  serverTimestamp,
   type DocumentReference,
+  type DocumentData,
+  type QueryDocumentSnapshot,
 } from "firebase/firestore";
 import {
   signInAnonymously,
@@ -19,6 +25,21 @@ import { getFirebase, CONNECTIONS_COLLECTION } from "@/lib/firebase";
 
 export type ChatStatus = "idle" | "searching" | "connected" | "peer-left";
 export type ChatRole = "caller" | "callee" | null;
+
+export type PermissionKind =
+  | "denied"
+  | "no-device"
+  | "busy"
+  | "unsupported"
+  | "insecure";
+
+export interface PermissionErrorInfo {
+  kind: PermissionKind;
+  title: string;
+  message: string;
+  /** Browser will allow getUserMedia to prompt again (denied, non-dismissed). */
+  canReprompt: boolean;
+}
 
 export interface ChatMessage {
   id: string;
@@ -50,10 +71,126 @@ const ICE_SERVERS = {
   iceCandidatePoolSize: 10,
 } as RTCConfiguration;
 
+/** Fresh-session retry policy for failed / timed-out connections. */
+const SEARCH_TIMEOUT_MS = 25_000;
+const MAX_AUTO_RETRIES = 2;
+const RETRY_DELAY_MS = 1_200;
+/** Cap chat history so a long session can't grow memory unboundedly. */
+const MAX_MESSAGES = 200;
+/** Cap signaling-adjacent payloads; oversize frames are dropped, not rendered. */
+const MAX_MESSAGE_LEN = 2_000;
+/** Client-side abuse gates (server enforcement = App Check + rules). */
+const START_COOLDOWN_MS = 3_000; // min gap between user-initiated starts
+const MAX_STARTS_PER_MIN = 8; // room-create cap per rolling 60s window
+const START_WINDOW_MS = 60_000;
+const MAX_SEND_PER_WINDOW = 8; // chat messages per rolling 10s window
+const SEND_WINDOW_MS = 10_000;
+const NOTICE_MS = 2_500; // transient rate-limit toast lifetime
+/** Janitor: reap open rooms idle this long; capped docs per sweep. */
+const STALE_OPEN_ROOM_MS = 10 * 60 * 1000;
+const SWEEP_LIMIT = 10;
+/** Delayed ICE re-sweep catches late candidates from a dying remote peer. */
+const RESWEEP_DELAY_MS = 3_000;
+
 let msgSeq = 0;
 function makeId() {
   msgSeq += 1;
   return `${Date.now()}-${msgSeq}`;
+}
+
+function classifyCameraError(e: unknown): PermissionErrorInfo {
+  const err = e as DOMException & { code?: number; message?: string };
+  const name = err?.name ?? "";
+  switch (name) {
+    case "NotAllowedError":
+    case "SecurityError":
+      return {
+        kind: "denied",
+        title: "Camera / mic access blocked",
+        message:
+          "DiceCam needs camera and microphone access. Grant permission in your browser, then try again.",
+        canReprompt: true,
+      };
+    case "NotFoundError":
+    case "OverconstrainedError":
+      return {
+        kind: "no-device",
+        title: "No camera or microphone found",
+        message:
+          "No usable camera/microphone was found. Plug one in (or pick another device), then try again.",
+        canReprompt: true,
+      };
+    case "NotReadableError":
+    case "AbortError":
+      return {
+        kind: "busy",
+        title: "Camera is busy",
+        message:
+          "Your camera/mic is in use by another app or tab. Close it, then try again.",
+        canReprompt: true,
+      };
+    default:
+      return {
+        kind: "unsupported",
+        title: "Camera unavailable",
+        message:
+          "Could not access camera/microphone on this device or browser. Try a modern browser over HTTPS.",
+        canReprompt: false,
+      };
+  }
+}
+
+/** Best-effort label of which device the browser reports as denied. */
+async function queryDevicePermissionStates(): Promise<{
+  camera: string;
+  mic: string;
+}> {
+  const fallback = { camera: "unknown", mic: "unknown" };
+  try {
+    const nav = navigator as Navigator & {
+      permissions?: {
+        query(o: { name: string }): Promise<{ state: string }>;
+      };
+    };
+    if (!nav.permissions?.query) return fallback;
+    const [cam, mic] = await Promise.all([
+      nav.permissions.query({ name: "camera" as PermissionName }).catch(() => null),
+      nav.permissions.query({ name: "microphone" as PermissionName }).catch(() => null),
+    ]);
+    return {
+      camera: cam?.state ?? "unknown",
+      mic: mic?.state ?? "unknown",
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+function isRetryableStartError(e: unknown): boolean {
+  const err = e as { code?: string; message?: string; name?: string };
+  const hay = `${err?.code ?? ""} ${err?.message ?? ""} ${err?.name ?? ""}`.toLowerCase();
+  return (
+    hay.includes("unavailable") ||
+    hay.includes("deadline-exceeded") ||
+    hay.includes("internal") ||
+    hay.includes("failed") ||
+    hay.includes("timeout") ||
+    hay.includes("network") ||
+    hay.includes("not authenticated") ||
+    hay.includes("invalid state") ||
+    hay.includes("invalidaccess")
+  );
+}
+
+function validSdp(value: unknown): value is RTCSessionDescriptionInit {
+  if (!value || typeof value !== "object") return false;
+  const v = value as { type?: unknown; sdp?: unknown };
+  return (
+    typeof v.type === "string" &&
+    typeof v.sdp === "string" &&
+    v.sdp.length > 0 &&
+    v.sdp.length <= 64 * 1024
+  );
 }
 
 /**
@@ -71,6 +208,10 @@ export function useRandomChat() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [channelOpen, setChannelOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [canRetryError, setCanRetryError] = useState(false);
+  const [permissionError, setPermissionError] =
+    useState<PermissionErrorInfo | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [role, setRole] = useState<ChatRole>(null);
 
   const peerRef = useRef<RTCPeerConnection | null>(null);
@@ -91,9 +232,43 @@ export function useRandomChat() {
   // Guards against the peer's own close/cancel events firing while we hang up.
   const intentionalCloseRef = useRef(false);
   const peerLeftTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const guardTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const connectedRef = useRef(false);
+  const mountedRef = useRef(true);
+  const sessionRef = useRef(0);
+  const retryCountRef = useRef(0);
 
-  const dismissError = useCallback(() => setError(null), []);
+  // Forward refs so peer-event handlers (defined below) can trigger a fresh
+  // session retry. Synced via effects — never written during render.
+  const startRef = useRef<
+    (opts?: { resetRetries?: boolean; force?: boolean }) => Promise<void>
+  >(async () => {});
+  const scheduleFreshRetryRef = useRef<
+    ((session: number, reason: string) => void) | null
+  >(null);
+
+  // Rate-limit bookkeeping (timestamps of recent user actions).
+  const lastStartAtRef = useRef(0);
+  const startTimesRef = useRef<number[]>([]);
+  const sendTimesRef = useRef<number[]>([]);
+  const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const resweepTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const failSession = useCallback(() => {
+    scheduleFreshRetryRef.current?.(sessionRef.current, "failed");
+  }, []);
+
+  const dismissError = useCallback(() => {
+    setError(null);
+    setCanRetryError(false);
+  }, []);
+
+  const dismissPermissionError = useCallback(
+    () => setPermissionError(null),
+    []
+  );
 
   const clearPeerLeftTimer = useCallback(() => {
     if (peerLeftTimerRef.current) {
@@ -102,13 +277,104 @@ export function useRandomChat() {
     }
   }, []);
 
+  const clearSearchTimer = useCallback(() => {
+    if (searchTimerRef.current) {
+      clearTimeout(searchTimerRef.current);
+      searchTimerRef.current = null;
+    }
+  }, []);
+
+  const clearRetryTimer = useCallback(() => {
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+  }, []);
+
+  const clearGuardTimer = useCallback(() => {
+    if (guardTimerRef.current) {
+      clearTimeout(guardTimerRef.current);
+      guardTimerRef.current = null;
+    }
+  }, []);
+
+  const clearNoticeTimer = useCallback(() => {
+    if (noticeTimerRef.current) {
+      clearTimeout(noticeTimerRef.current);
+      noticeTimerRef.current = null;
+    }
+  }, []);
+
+  const clearResweepTimer = useCallback(() => {
+    if (resweepTimerRef.current) {
+      clearTimeout(resweepTimerRef.current);
+      resweepTimerRef.current = null;
+    }
+  }, []);
+
+  const clearAllTimers = useCallback(() => {
+    clearPeerLeftTimer();
+    clearSearchTimer();
+    clearRetryTimer();
+    clearGuardTimer();
+    clearNoticeTimer();
+    clearResweepTimer();
+  }, [clearPeerLeftTimer, clearSearchTimer, clearRetryTimer, clearGuardTimer, clearNoticeTimer, clearResweepTimer]);
+
+  /** Transient toast for rate-limit hits (auto-dismisses, no dialog). */
+  const showNotice = useCallback(
+    (text: string) => {
+      if (!mountedRef.current) return;
+      setNotice(text);
+      clearNoticeTimer();
+      noticeTimerRef.current = setTimeout(() => {
+        noticeTimerRef.current = null;
+        if (mountedRef.current) setNotice(null);
+      }, NOTICE_MS);
+    },
+    [clearNoticeTimer]
+  );
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  // Best-effort room delete on tab close. The async delete usually loses
+  // the race with page unload — the sweep-on-start janitor covers the rest.
+  useEffect(() => {
+    const onUnload = () => {
+      const ref = roomInfoRef.current.Ref;
+      if (ref) deleteDoc(ref).catch(() => {});
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach((t) => {
+          try {
+            t.stop();
+          } catch {
+            /* noop */
+          }
+        });
+      }
+    };
+    window.addEventListener("beforeunload", onUnload);
+    return () => window.removeEventListener("beforeunload", onUnload);
+  }, []);
+
   /* ------------------------------ Messaging ------------------------------- */
   const pushMessage = useCallback(
     (from: "me" | "stranger", text: string) => {
-      setMessages((prev) => [
-        ...prev,
-        { id: makeId(), from, text, ts: Date.now() },
-      ]);
+      const safe = text.slice(0, MAX_MESSAGE_LEN);
+      setMessages((prev) => {
+        const next = [
+          ...prev,
+          { id: makeId(), from, text: safe, ts: Date.now() },
+        ];
+        return next.length > MAX_MESSAGES
+          ? next.slice(next.length - MAX_MESSAGES)
+          : next;
+      });
     },
     []
   );
@@ -150,21 +416,74 @@ export function useRandomChat() {
     [deleteCollectionDocs]
   );
 
-  /* --------------------------- Peer-left handling ------------------------- */
-  const handlePeerLeft = useCallback(() => {
+  /**
+   * Janitor: reap abandoned open rooms (caller vanished before match) so
+   * tab-close / crash orphans die on the next visit instead of piling up.
+   * Capped per sweep; warn-only failures. Rules allow anyone to delete
+   * rooms idle past the stale threshold.
+   */
+  const sweepStaleRooms = useCallback(async () => {
+    const { db } = getFirebase();
+    if (!db || !userRef.current) return;
+    let docs;
+    try {
+      docs = (
+        await getDocs(
+          query(
+            collection(db, CONNECTIONS_COLLECTION),
+            where("available", "==", true),
+            limit(SWEEP_LIMIT)
+          )
+        )
+      ).docs;
+    } catch {
+      return;
+    }
+    const now = Date.now();
+    const stale = docs.filter((d) => {
+      const ts = d.data()?.createdAt as { toMillis?: () => number } | undefined;
+      const ms = typeof ts?.toMillis === "function" ? ts.toMillis() : NaN;
+      return Number.isFinite(ms) && now - (ms as number) > STALE_OPEN_ROOM_MS;
+    });
+    await Promise.all(
+      stale.map(async (d) => {
+        const data = d.data();
+        // Room first: once it's gone, anyone may reap its ICE (orphan rule).
+        try {
+          await deleteDoc(d.ref);
+        } catch {
+          return;
+        }
+        const rid = typeof data?.id === "string" ? (data.id as string) : null;
+        if (!rid) return;
+        try {
+          await deleteCollectionDocs(rid + "caller");
+          await deleteCollectionDocs(rid + "callee");
+        } catch {
+          /* late ICE dies on a later sweep / resweep */
+        }
+      })
+    );
+  }, [deleteCollectionDocs]);
+
+  /* --------------------------- Peer teardown ------------------------------ */
+  /** Synchronously tear down peer + listeners + timers. No Firestore I/O. */
+  const teardownPeerSync = useCallback(() => {
     clearPeerLeftTimer();
-    if (intentionalCloseRef.current) return;
+    clearSearchTimer();
     connectedRef.current = false;
     setChannelOpen(false);
     setRemoteStream(null);
 
-    // Tear down the peer immediately; Firestore cleanup runs in background.
     const pc = peerRef.current;
     peerRef.current = null;
     if (pc) {
       try {
+        pc.onicecandidate = null;
         pc.ontrack = null;
         pc.ondatachannel = null;
+        pc.onconnectionstatechange = null;
+        pc.oniceconnectionstatechange = null;
         pc.close();
       } catch {
         /* noop */
@@ -172,6 +491,10 @@ export function useRandomChat() {
     }
     if (channelRef.current) {
       try {
+        channelRef.current.onopen = null;
+        channelRef.current.onclose = null;
+        channelRef.current.onmessage = null;
+        channelRef.current.onerror = null;
         channelRef.current.close();
       } catch {
         /* noop */
@@ -187,6 +510,13 @@ export function useRandomChat() {
       }
     });
     unsubsRef.current = [];
+  }, [clearPeerLeftTimer, clearSearchTimer]);
+
+  /* --------------------------- Peer-left handling ------------------------- */
+  const handlePeerLeft = useCallback(() => {
+    clearPeerLeftTimer();
+    if (intentionalCloseRef.current) return;
+    teardownPeerSync();
 
     const captured = {
       info: { ...roomInfoRef.current },
@@ -200,23 +530,34 @@ export function useRandomChat() {
     );
 
     setStatus("peer-left");
-  }, [clearPeerLeftTimer, cleanupRemoteRoomData]);
+  }, [clearPeerLeftTimer, teardownPeerSync, cleanupRemoteRoomData]);
 
   /* ------------------------------ Data channel ---------------------------- */
   const wireDataChannel = useCallback(
     (channel: RTCDataChannel) => {
       channelRef.current = channel;
-      channel.onopen = () => setChannelOpen(true);
+      channel.onopen = () => {
+        if (mountedRef.current) setChannelOpen(true);
+      };
       channel.onclose = () => {
-        setChannelOpen(false);
+        if (mountedRef.current) setChannelOpen(false);
         if (!intentionalCloseRef.current) handlePeerLeft();
+      };
+      channel.onerror = () => {
+        if (mountedRef.current) setChannelOpen(false);
       };
       channel.onmessage = (event) => {
         try {
-          const payload = JSON.parse(event.data) as { text?: string };
-          if (payload && typeof payload.text === "string") {
+          const payload = JSON.parse(event.data) as { text?: unknown };
+          if (
+            payload &&
+            typeof payload.text === "string" &&
+            payload.text.length > 0 &&
+            payload.text.length <= MAX_MESSAGE_LEN
+          ) {
             pushMessage("stranger", payload.text);
           }
+          /* oversize / malformed frames dropped silently */
         } catch {
           /* ignore malformed frames */
         }
@@ -227,19 +568,29 @@ export function useRandomChat() {
 
   const sendMessage = useCallback(
     (text: string) => {
-      const trimmed = text.trim();
+      const trimmed = text.trim().slice(0, MAX_MESSAGE_LEN);
       if (!trimmed) return false;
+      // Sliding-window spam gate: max N messages per window.
+      const now = Date.now();
+      sendTimesRef.current = sendTimesRef.current.filter(
+        (t) => now - t < SEND_WINDOW_MS
+      );
+      if (sendTimesRef.current.length >= MAX_SEND_PER_WINDOW) {
+        showNotice("Slow down — message not sent.");
+        return false;
+      }
       const channel = channelRef.current;
       if (!channel || channel.readyState !== "open") return false;
       try {
-        channel.send(JSON.stringify({ text: trimmed, ts: Date.now() }));
+        channel.send(JSON.stringify({ text: trimmed, ts: now }));
+        sendTimesRef.current.push(now);
         pushMessage("me", trimmed);
         return true;
       } catch {
         return false;
       }
     },
-    [pushMessage]
+    [pushMessage, showNotice]
   );
 
   /* ----------------------------- Firebase auth ---------------------------- */
@@ -271,13 +622,27 @@ export function useRandomChat() {
   /* ------------------------------- Camera --------------------------------- */
   const ensureCamera = useCallback(async () => {
     if (localStreamRef.current) return localStreamRef.current;
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: true,
-      video: true,
-    });
-    localStreamRef.current = stream;
-    setLocalStream(stream);
-    return stream;
+    if (typeof window === "undefined" || !navigator?.mediaDevices?.getUserMedia) {
+      throw Object.assign(new Error("unsupported"), {
+        __permKind: "unsupported" as PermissionKind,
+      });
+    }
+    if (!window.isSecureContext) {
+      throw Object.assign(new Error("insecure-context"), {
+        __permKind: "insecure" as PermissionKind,
+      });
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: true,
+      });
+      localStreamRef.current = stream;
+      if (mountedRef.current) setLocalStream(stream);
+      return stream;
+    } catch (e) {
+      throw e;
+    }
   }, []);
 
   /* ----------------------- Firestore signaling ---------------------------- */
@@ -304,7 +669,8 @@ export function useRandomChat() {
       const { db } = getFirebase();
       if (!db || !userRef.current) return;
       const ownerUid = userRef.current.uid;
-      const handler = (event: RTCPeerConnectionEventMap["icecandidate"]) => {
+      // Single onicecandidate assignment per peer (nulled on teardown).
+      peerConnection.onicecandidate = (event) => {
         if (event.candidate) {
           const json = event.candidate.toJSON();
           addDoc(collection(db, roomId + role), {
@@ -312,12 +678,13 @@ export function useRandomChat() {
             ownerUid,
             usernameFragment: json.usernameFragment || null,
             roomOwnerUid: roomOwnerUid || null,
+            roomId,
+            createdAt: serverTimestamp(),
           }).catch((err) =>
             console.warn("ICE send failed:", (err as Error)?.message)
           );
         }
       };
-      peerConnection.addEventListener("icecandidate", handler);
     },
     []
   );
@@ -371,6 +738,10 @@ export function useRandomChat() {
             !peerConnection.currentRemoteDescription &&
             data.answer
           ) {
+            if (!validSdp(data.answer)) {
+              console.warn("ignoring malformed answer");
+              return;
+            }
             const answer = new RTCSessionDescription(
               data.answer as RTCSessionDescriptionInit
             );
@@ -415,6 +786,7 @@ export function useRandomChat() {
         available: true,
         joinedUid: null,
         ownerUid: user.uid,
+        createdAt: serverTimestamp(),
       };
       info.Ref = await addDoc(
         collection(db, CONNECTIONS_COLLECTION),
@@ -435,102 +807,164 @@ export function useRandomChat() {
     ]
   );
 
+  /** Atomically claim an available room; throws if already taken. */
+  const claimRoom = useCallback(
+    async (
+      roomRef: DocumentReference<DocumentData>,
+      answer: RTCSessionDescriptionInit,
+      uid: string
+    ): Promise<{ generateId: string; ownerUid: string | null }> => {
+      const { db } = getFirebase();
+      if (!db) throw new Error("Not authenticated");
+      return runTransaction(db, async (tx) => {
+        const snap = await tx.get(roomRef);
+        if (!snap.exists()) throw new Error("room-gone");
+        const data = snap.data();
+        if (data?.available !== true || data?.joinedUid != null) {
+          throw new Error("room-taken");
+        }
+        if (!validSdp(data.offer)) throw new Error("room-malformed");
+        tx.update(roomRef, {
+          answer: { type: answer.type, sdp: answer.sdp },
+          available: false,
+          joinedUid: uid,
+          ownerUid: data.ownerUid ?? null,
+        });
+        return {
+          generateId: data.id as string,
+          ownerUid: (data.ownerUid as string) ?? null,
+        };
+      });
+    },
+    []
+  );
+
   const joinCall = useCallback(
     async (info: RoomInfo, peerConnection: RTCPeerConnection) => {
       const { db } = getFirebase();
       const user = userRef.current;
       if (!db || !user) throw new Error("Not authenticated");
 
-      const querySnapshot = await getDocs(
-        collection(db, CONNECTIONS_COLLECTION)
-      );
-      let roomDoc: (typeof querySnapshot.docs)[number]["data"] | null = null;
-      let roomRef: DocumentReference | null = null;
+      // Only fetch rooms actually available — never the whole collection.
+      let candidates: QueryDocumentSnapshot<DocumentData>[] = [];
+      try {
+        const q = query(
+          collection(db, CONNECTIONS_COLLECTION),
+          where("available", "==", true),
+          limit(5)
+        );
+        candidates = (await getDocs(q)).docs;
+      } catch (e) {
+        console.warn("room lookup failed:", (e as Error)?.message);
+        candidates = [];
+      }
 
-      for (const d of querySnapshot.docs) {
-        const data = d.data();
-        if (data?.available === true) {
-          roomDoc = data;
-          roomRef = d.ref;
-          break;
+      for (const doc of candidates) {
+        const data = doc.data();
+        if (!validSdp(data?.offer)) continue;
+        try {
+          // Callee — receives the caller's data channel.
+          await peerConnection.setRemoteDescription(
+            data.offer as RTCSessionDescriptionInit
+          );
+          const answer = await peerConnection.createAnswer();
+          await peerConnection.setLocalDescription(answer);
+          // Atomic claim: losers get "room-taken" and try the next room.
+          const { generateId, ownerUid } = await claimRoom(
+            doc.ref,
+            { type: answer.type, sdp: answer.sdp },
+            user.uid
+          );
+          setRole("callee");
+          info.Ref = doc.ref;
+          info.Id = doc.ref.id;
+          sendCandidateToRemotePeer(
+            generateId,
+            peerConnection,
+            "callee",
+            ownerUid
+          );
+          listenToRemoteCandidate(generateId, peerConnection, "callee");
+          trackActiveRoom(info, generateId, ownerUid, user.uid);
+          return;
+        } catch (e) {
+          const msg = ((e as Error)?.message ?? "").toLowerCase();
+          // Room taken / gone / malformed → try next candidate.
+          // Permission-denied here means a stale room from before the
+          // hardened rules (no createdAt) — skip it too; if rules are
+          // genuinely broken, sendOffer below fails and surfaces the error.
+          if (
+            msg.includes("room-taken") ||
+            msg.includes("room-gone") ||
+            msg.includes("room-malformed") ||
+            msg.includes("permission") ||
+            msg.includes("insufficient")
+          ) {
+            continue;
+          }
+          throw e;
         }
       }
 
-      if (!roomRef || !roomDoc) {
-        await sendOffer(info, peerConnection);
-        return;
-      }
-
-      // Callee — receives the caller's data channel.
-      setRole("callee");
-      info.Ref = roomRef;
-      info.Id = roomRef.id;
-
-      const offer = roomDoc.offer;
-      await peerConnection.setRemoteDescription(
-        offer as RTCSessionDescriptionInit
-      );
-      const answer = await peerConnection.createAnswer();
-      await peerConnection.setLocalDescription(answer);
-
-      const generateId = roomDoc.id as string;
-      const ownerUid = (roomDoc.ownerUid as string) || null;
-      sendCandidateToRemotePeer(generateId, peerConnection, "callee", ownerUid);
-      listenToRemoteCandidate(generateId, peerConnection, "callee");
-
-      await updateDoc(roomRef, {
-        answer: { type: answer.type, sdp: answer.sdp },
-        available: false,
-        joinedUid: user.uid,
-        ownerUid: ownerUid ?? null,
-      });
-      trackActiveRoom(info, generateId, ownerUid, user.uid);
+      await sendOffer(info, peerConnection);
     },
-    [sendOffer, sendCandidateToRemotePeer, listenToRemoteCandidate, trackActiveRoom]
+    [sendOffer, sendCandidateToRemotePeer, listenToRemoteCandidate, trackActiveRoom, claimRoom]
   );
 
   /* ------------------------------ Peer factory ---------------------------- */
   const createPeer = useCallback(async () => {
     const peerConnection = new RTCPeerConnection(ICE_SERVERS);
 
-    peerConnection.addEventListener("track", (event) => {
+    peerConnection.ontrack = (event) => {
       const [stream] = event.streams;
-      if (stream) setRemoteStream(stream);
+      if (stream && mountedRef.current) setRemoteStream(stream);
       if (!connectedRef.current) {
         connectedRef.current = true;
-        setStatus("connected");
+        clearSearchTimer();
+        if (mountedRef.current) setStatus("connected");
       }
-    });
+    };
 
     // Callee receives the caller's data channel here.
-    peerConnection.addEventListener("datachannel", (event) => {
+    peerConnection.ondatachannel = (event) => {
       wireDataChannel(event.channel);
-    });
+    };
 
-    peerConnection.addEventListener("connectionstatechange", () => {
+    peerConnection.onconnectionstatechange = () => {
       const state = peerConnection.connectionState;
       if (state === "connected") {
         clearPeerLeftTimer();
+        clearSearchTimer();
         if (!connectedRef.current) {
           connectedRef.current = true;
-          setStatus("connected");
+          if (mountedRef.current) setStatus("connected");
         }
-      } else if (state === "failed" || state === "closed") {
+      } else if (state === "failed") {
+        if (!intentionalCloseRef.current) failSession();
+      } else if (state === "closed") {
         if (!intentionalCloseRef.current) handlePeerLeft();
       }
-    });
+    };
 
-    peerConnection.addEventListener("iceconnectionstatechange", () => {
+    peerConnection.oniceconnectionstatechange = () => {
       const state = peerConnection.iceConnectionState;
       if (state === "disconnected") {
         clearPeerLeftTimer();
         peerLeftTimerRef.current = setTimeout(() => {
           if (!intentionalCloseRef.current) handlePeerLeft();
         }, 5000);
-      } else if (state === "connected" || state === "completed") {
+      } else if (
+        state === "connected" ||
+        state === "completed" ||
+        state === "failed"
+      ) {
+        if (state === "failed") {
+          if (!intentionalCloseRef.current) failSession();
+          return;
+        }
         clearPeerLeftTimer();
       }
-    });
+    };
 
     // Attach local tracks if the camera is already running.
     const local = localStreamRef.current;
@@ -545,7 +979,7 @@ export function useRandomChat() {
     }
 
     return peerConnection;
-  }, [wireDataChannel, clearPeerLeftTimer, handlePeerLeft]);
+  }, [wireDataChannel, clearPeerLeftTimer, clearSearchTimer, handlePeerLeft, failSession]);
 
   /* ------------------------------- Hang up -------------------------------- */
   /**
@@ -554,42 +988,11 @@ export function useRandomChat() {
    */
   const hangUp = useCallback(
     (opts: { keepCamera?: boolean } = {}) => {
+      // Invalidate any in-flight start() for the previous session.
+      sessionRef.current += 1;
       intentionalCloseRef.current = true;
-      clearPeerLeftTimer();
-      connectedRef.current = false;
-      setChannelOpen(false);
-      setRemoteStream(null);
-
-      // 1. Immediately tear down the peer connection.
-      const pc = peerRef.current;
-      peerRef.current = null;
-      if (pc) {
-        try {
-          pc.ontrack = null;
-          pc.ondatachannel = null;
-          pc.close();
-        } catch {
-          /* noop */
-        }
-      }
-      if (channelRef.current) {
-        try {
-          channelRef.current.close();
-        } catch {
-          /* noop */
-        }
-        channelRef.current = null;
-      }
-
-      // 2. Stop listening to Firestore (synchronous).
-      unsubsRef.current.forEach((u) => {
-        try {
-          u();
-        } catch {
-          /* noop */
-        }
-      });
-      unsubsRef.current = [];
+      clearAllTimers();
+      teardownPeerSync();
 
       // Capture room state for background cleanup, then clear refs.
       const captured = {
@@ -598,61 +1001,300 @@ export function useRandomChat() {
       };
       roomInfoRef.current = { Ref: null, Id: null };
       activeRoomRef.current = { roomId: null, ownerUid: null, joinedUid: null };
-      setRole(null);
+      if (mountedRef.current) setRole(null);
 
-      // 3. Camera handling.
+      // Camera handling.
       if (!opts.keepCamera) {
         if (localStreamRef.current) {
-          localStreamRef.current.getTracks().forEach((t) => t.stop());
+          localStreamRef.current.getTracks().forEach((t) => {
+            try {
+              t.stop();
+            } catch {
+              /* noop */
+            }
+          });
           localStreamRef.current = null;
         }
-        setLocalStream(null);
+        if (mountedRef.current) setLocalStream(null);
       }
 
-      // 4. Background Firestore cleanup (fire and forget).
+      // Background Firestore cleanup (fire and forget).
       cleanupRemoteRoomData(captured).catch((e) =>
         console.warn("background cleanup failed:", (e as Error)?.message)
       );
 
+      // Delayed ICE re-sweep: the remote peer may still be alive for a
+      // second and write candidates after our first pass. Room doc is
+      // already gone, so the orphan-ICE rule lets anyone reap them.
+      const leftRoomId = captured.room.roomId || captured.info.Id;
+      if (leftRoomId) {
+        clearResweepTimer();
+        resweepTimerRef.current = setTimeout(() => {
+          resweepTimerRef.current = null;
+          if (!mountedRef.current) return;
+          deleteCollectionDocs(leftRoomId + "caller").catch(() => {});
+          deleteCollectionDocs(leftRoomId + "callee").catch(() => {});
+        }, RESWEEP_DELAY_MS);
+      }
+
       // Reset the manual-close guard shortly after, so a fresh start is clean.
-      setTimeout(() => {
+      clearGuardTimer();
+      guardTimerRef.current = setTimeout(() => {
         intentionalCloseRef.current = false;
+        guardTimerRef.current = null;
       }, 300);
     },
-    [clearPeerLeftTimer, cleanupRemoteRoomData]
+    [clearAllTimers, clearGuardTimer, clearResweepTimer, teardownPeerSync, cleanupRemoteRoomData, deleteCollectionDocs]
+  );
+
+  /* --------- Fresh-session retry on failure / timeout --------- */
+
+  const scheduleFreshRetry = useCallback(
+    (session: number, reason: string) => {
+      if (!mountedRef.current) return;
+      if (sessionRef.current !== session) return;
+      if (retryCountRef.current >= MAX_AUTO_RETRIES) {
+        teardownPeerSync();
+        roomInfoRef.current = { Ref: null, Id: null };
+        activeRoomRef.current = { roomId: null, ownerUid: null, joinedUid: null };
+        if (mountedRef.current) {
+          setStatus("idle");
+          setError(
+            `Connection ${reason}. Check your network and try again.`
+          );
+          setCanRetryError(true);
+        }
+        return;
+      }
+      retryCountRef.current += 1;
+      // Full teardown (keep camera so we don't re-prompt), then fresh session.
+      hangUp({ keepCamera: true });
+      clearRetryTimer();
+      retryTimerRef.current = setTimeout(() => {
+        retryTimerRef.current = null;
+        if (!mountedRef.current) return;
+        void startRef.current({ resetRetries: false, force: true });
+      }, RETRY_DELAY_MS);
+    },
+    [hangUp, clearRetryTimer, teardownPeerSync]
+  );
+
+  // Keep mutable retry/start refs in sync via effects (no render-time writes).
+  useEffect(() => {
+    scheduleFreshRetryRef.current = scheduleFreshRetry;
+  }, [scheduleFreshRetry]);
+
+  const armSearchTimeout = useCallback(
+    (session: number) => {
+      clearSearchTimer();
+      searchTimerRef.current = setTimeout(() => {
+        searchTimerRef.current = null;
+        if (!mountedRef.current) return;
+        if (sessionRef.current !== session) return;
+        if (connectedRef.current) return;
+        // Still searching after timeout → fresh session retry.
+        scheduleFreshRetry(session, "timed out");
+      }, SEARCH_TIMEOUT_MS);
+    },
+    [clearSearchTimer, scheduleFreshRetry]
   );
 
   /* -------------------------------- Start --------------------------------- */
-  const start = useCallback(async () => {
-    setError(null);
-    setMessages([]);
-    setStatus("searching");
-    connectedRef.current = false;
-    intentionalCloseRef.current = false;
+  const start = useCallback(
+    async (opts: { resetRetries?: boolean; force?: boolean } = {}) => {
+      const resetRetries = opts.resetRetries ?? true;
+      const force = opts.force ?? false;
+      // User-initiated abuse gates (internal auto-retries bypass via force).
+      if (!force) {
+        const now = Date.now();
+        if (now - lastStartAtRef.current < START_COOLDOWN_MS) {
+          showNotice("Give it a sec before searching again.");
+          return;
+        }
+        startTimesRef.current = startTimesRef.current.filter(
+          (t) => now - t < START_WINDOW_MS
+        );
+        if (startTimesRef.current.length >= MAX_STARTS_PER_MIN) {
+          showNotice("Too many attempts — wait a minute, then retry.");
+          return;
+        }
+        lastStartAtRef.current = now;
+        startTimesRef.current.push(now);
+      }
+      // Janitor pass on every visit — keeps tab-close orphans from piling.
+      sweepStaleRooms().catch(() => {});
+      clearRetryTimer();
+      clearSearchTimer();
+      dismissError();
+      if (resetRetries) {
+        retryCountRef.current = 0;
+        setPermissionError(null);
+      }
+      setMessages([]);
+      setStatus("searching");
+      connectedRef.current = false;
+      intentionalCloseRef.current = false;
+      const session = sessionRef.current + 1;
+      sessionRef.current = session;
+      armSearchTimeout(session);
 
-    try {
-      await ensureAnonymousAuth();
-      await ensureCamera();
+      try {
+        await ensureAnonymousAuth();
+        if (sessionRef.current !== session || !mountedRef.current) return;
+        await ensureCamera();
+        if (sessionRef.current !== session || !mountedRef.current) return;
 
-      const peerConnection = await createPeer();
-      peerRef.current = peerConnection;
+        const peerConnection = await createPeer();
+        if (sessionRef.current !== session || !mountedRef.current) {
+          try {
+            peerConnection.close();
+          } catch {
+            /* noop */
+          }
+          return;
+        }
+        peerRef.current = peerConnection;
 
-      const info: RoomInfo = { Ref: null, Id: null };
-      await joinCall(info, peerConnection);
-    } catch (e) {
-      const err = e as { code?: string; message?: string };
-      console.warn("start failed:", err?.code || err?.message || err);
-      hangUp({ keepCamera: false });
-      setStatus("idle");
-      // Generic, friendly message — no internals leaked to the user.
-      setError("Sorry, something bad just happened. Try again after a moment.");
-    }
-  }, [ensureAnonymousAuth, ensureCamera, createPeer, joinCall, hangUp]);
+        const info: RoomInfo = { Ref: null, Id: null };
+        await joinCall(info, peerConnection);
+        if (sessionRef.current !== session || !mountedRef.current) return;
+      } catch (e) {
+        if (sessionRef.current !== session || !mountedRef.current) return;
+        const err = e as DOMException & {
+          code?: string;
+          message?: string;
+          __permKind?: PermissionKind;
+        };
+
+        // 1. Camera / mic permission & device failures → dedicated dialog.
+        const permNames = new Set([
+          "NotAllowedError",
+          "SecurityError",
+          "NotFoundError",
+          "OverconstrainedError",
+          "NotReadableError",
+          "AbortError",
+        ]);
+        if (
+          err?.__permKind ||
+          (err?.name && permNames.has(err.name)) ||
+          /permission|getusermedia|media/i.test(err?.message ?? "")
+        ) {
+          console.warn(
+            "camera failed:",
+            err?.name || err?.code || err?.message || err
+          );
+          hangUp({ keepCamera: false });
+          setStatus("idle");
+          let info = classifyCameraError(e);
+          if (err?.__permKind === "unsupported") {
+            info = {
+              kind: "unsupported",
+              title: "Camera not supported",
+              message:
+                "This browser can't access camera/mic (getUserMedia missing). Use a modern browser over HTTPS.",
+              canReprompt: false,
+            };
+          } else if (err?.__permKind === "insecure") {
+            info = {
+              kind: "insecure",
+              title: "Insecure context",
+              message:
+                "Camera/mic require HTTPS or localhost. Serve the app securely, then try again.",
+              canReprompt: false,
+            };
+          } else if (info.kind === "denied") {
+            // Label which device is actually blocked when the API tells us.
+            try {
+              const states = await queryDevicePermissionStates();
+              const camDenied = states.camera === "denied";
+              const micDenied = states.mic === "denied";
+              if (camDenied && !micDenied) {
+                info = {
+                  ...info,
+                  title: "Camera access blocked",
+                  message:
+                    "Camera is blocked but mic looks OK. Allow camera in the site settings, then try again.",
+                };
+              } else if (micDenied && !camDenied) {
+                info = {
+                  ...info,
+                  title: "Microphone access blocked",
+                  message:
+                    "Microphone is blocked but camera looks OK. Allow mic in the site settings, then try again.",
+                };
+              }
+            } catch {
+              /* keep generic denied copy */
+            }
+          }
+          setPermissionError(info);
+          return;
+        }
+
+        // 2. Retryable network / signaling failure → fresh session retry.
+        console.warn("start failed:", err?.code || err?.message || err);
+        if (
+          isRetryableStartError(e) &&
+          retryCountRef.current < MAX_AUTO_RETRIES
+        ) {
+          retryCountRef.current += 1;
+          hangUp({ keepCamera: true });
+          clearRetryTimer();
+          retryTimerRef.current = setTimeout(() => {
+            retryTimerRef.current = null;
+            if (!mountedRef.current) return;
+            if (sessionRef.current !== session) {
+              // hangUp bumped the session; start a new one.
+              void startRef.current({ resetRetries: false, force: true });
+              return;
+            }
+            void startRef.current({ resetRetries: false, force: true });
+          }, RETRY_DELAY_MS);
+          return;
+        }
+
+        // 3. Anything else → generic, friendly message — no internals leaked.
+        hangUp({ keepCamera: false });
+        setStatus("idle");
+        setError("Sorry, something bad just happened. Try again after a moment.");
+        setCanRetryError(true);
+      }
+    },
+    [
+      ensureAnonymousAuth,
+      ensureCamera,
+      createPeer,
+      joinCall,
+      hangUp,
+      armSearchTimeout,
+      clearRetryTimer,
+      clearSearchTimer,
+      dismissError,
+      showNotice,
+      sweepStaleRooms,
+    ]
+  );
+  useEffect(() => {
+    startRef.current = start;
+  }, [start]);
+
+  /** Manual "try again" for the generic error dialog (fresh session). */
+  const retryConnection = useCallback(() => {
+    dismissError();
+    void start({ resetRetries: true, force: true });
+  }, [dismissError, start]);
+
+  /** "Try again" for the permission dialog (re-prompts getUserMedia). */
+  const retryPermissions = useCallback(() => {
+    setPermissionError(null);
+    void start({ resetRetries: true, force: true });
+  }, [start]);
 
   const nextPerson = useCallback(async () => {
     // Drop the current peer (keep the camera), then search again.
     hangUp({ keepCamera: true });
-    await start();
+    await start({ resetRetries: true });
   }, [hangUp, start]);
 
   const disconnect = useCallback(() => {
@@ -663,20 +1305,49 @@ export function useRandomChat() {
   /* ------------------------------ Tear down on unmount -------------------- */
   useEffect(() => {
     return () => {
+      mountedRef.current = false;
       intentionalCloseRef.current = true;
-      clearPeerLeftTimer();
+      clearAllTimers();
       const pc = peerRef.current;
+      peerRef.current = null;
       if (pc) {
         try {
+          pc.onicecandidate = null;
+          pc.ontrack = null;
+          pc.ondatachannel = null;
+          pc.onconnectionstatechange = null;
+          pc.oniceconnectionstatechange = null;
           pc.close();
         } catch {
           /* noop */
         }
       }
+      if (channelRef.current) {
+        try {
+          channelRef.current.onopen = null;
+          channelRef.current.onclose = null;
+          channelRef.current.onmessage = null;
+          channelRef.current.onerror = null;
+          channelRef.current.close();
+        } catch {
+          /* noop */
+        }
+        channelRef.current = null;
+      }
       if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((t) => t.stop());
+        localStreamRef.current.getTracks().forEach((t) => {
+          try {
+            t.stop();
+          } catch {
+            /* noop */
+          }
+        });
         localStreamRef.current = null;
       }
+      const captured = {
+        info: { ...roomInfoRef.current },
+        room: { ...activeRoomRef.current },
+      };
       unsubsRef.current.forEach((u) => {
         try {
           u();
@@ -684,8 +1355,11 @@ export function useRandomChat() {
           /* noop */
         }
       });
+      unsubsRef.current = [];
+      // Best-effort orphan cleanup; fire and forget on unmount.
+      cleanupRemoteRoomData(captured).catch(() => {});
     };
-  }, [clearPeerLeftTimer]);
+  }, [clearAllTimers, cleanupRemoteRoomData]);
 
   return {
     status,
@@ -695,7 +1369,13 @@ export function useRandomChat() {
     messages,
     channelOpen,
     error,
+    canRetryError,
     dismissError,
+    retryConnection,
+    permissionError,
+    dismissPermissionError,
+    retryPermissions,
+    notice,
     start,
     disconnect,
     nextPerson,

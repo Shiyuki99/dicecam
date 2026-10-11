@@ -1,0 +1,121 @@
+rules_version = '2';
+
+// DiceCam signaling rules for the Next app (replaces the old Vanilla rules,
+// which are unused). Scoped to the rooms collection + per-room ICE candidate
+// collections — no wildcard catch-all.
+//
+// Deploy option A (console, no CLI):
+//   Firebase Console → Firestore Database → Rules tab → paste → Publish.
+// Deploy option B (CLI):
+//   firebase use <project-id>
+//   firebase deploy --only firestore:rules
+//   (needs firebase.json: {"firestore": {"rules": "firestore.rules"}})
+//
+// IMPORTANT — App Check is NOT enforced by this file; rules cannot see App
+// Check tokens. Enforcement lives in:
+//   Firebase Console → App Check → Firestore → Enforce.
+// Ship order: deploy rules → verify app works → watch App Check metrics →
+// flip to Enforced to cut off bot / script traffic.
+//
+// If you changed NEXT_PUBLIC_FIREBASE_DB_COLLECTION, rename the
+// `connections` match below to the same value.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function smallString(v, max) {
+      return v is string && v.size() <= max;
+    }
+
+    function offerShape(o) {
+      return o is map
+        && smallString(o.type, 16)
+        && o.sdp is string && o.sdp.size() > 0 && o.sdp.size() <= 64 * 1024;
+    }
+
+    /* ------------------------------ Rooms -------------------------------- */
+    match /connections/{roomId} {
+      allow read: if signedIn();
+
+      // Caller creates an open room it owns. createdAt must be server time
+      // (client writes serverTimestamp()) so docs can't be backdated — this
+      // also enables future TTL cleanup via scheduled functions.
+      allow create: if signedIn()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.available == true
+        && request.resource.data.joinedUid == null
+        && smallString(request.resource.data.id, 32)
+        && offerShape(request.resource.data.offer)
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.keys().hasOnly(
+             ['offer', 'id', 'available', 'joinedUid', 'ownerUid', 'createdAt']);
+
+      // Only legal transition: open + unclaimed → claimed with an answer.
+      // Owner and creation time are immutable.
+      allow update: if signedIn()
+        && resource.data.available == true
+        && resource.data.joinedUid == null
+        && request.resource.data.ownerUid == resource.data.ownerUid
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.joinedUid == request.auth.uid
+        && request.resource.data.available == false
+        && offerShape(resource.data.offer)
+        && offerShape(request.resource.data.answer)
+        && request.resource.data.keys().hasOnly(
+             ['offer', 'answer', 'id', 'available', 'joinedUid',
+              'ownerUid', 'createdAt']);
+
+      allow delete: if signedIn()
+        && (resource.data.ownerUid == request.auth.uid
+          || resource.data.joinedUid == request.auth.uid
+          // Janitor: anyone may reap abandoned rooms. Open rooms idle 10min
+          // (caller vanished before match); claimed rooms idle 60min (both
+          // sides gone without cleanup, e.g. tab close / crash).
+          || (resource.data.available == true
+            && resource.data.createdAt < request.time - duration.value(10, 'm'))
+          || resource.data.createdAt < request.time - duration.value(60, 'm'));
+    }
+
+    /* -------------------------- ICE candidates ---------------------------- */
+    // Collections look like <6-char-roomId>caller / <6-char-roomId>callee.
+    match /{collId}/{docId} {
+      function isCandidateColl() {
+        return collId.matches('^[A-Za-z0-9]{6}(caller|callee)$');
+      }
+      function candidateShape() {
+        return request.resource.data.ownerUid == request.auth.uid
+          && smallString(request.resource.data.candidate, 4096)
+          && smallString(request.resource.data.sdpMid, 32)
+          && request.resource.data.sdpMLineIndex is int
+          && request.resource.data.sdpMLineIndex >= 0
+          && (request.resource.data.usernameFragment == null
+            || smallString(request.resource.data.usernameFragment, 128))
+          && smallString(request.resource.data.roomOwnerUid, 128)
+          && smallString(request.resource.data.roomId, 32)
+          && request.resource.data.createdAt == request.time
+          && request.resource.data.keys().hasOnly(
+               ['candidate', 'sdpMid', 'sdpMLineIndex', 'usernameFragment',
+                'ownerUid', 'roomOwnerUid', 'roomId', 'createdAt']);
+      }
+
+      allow read: if signedIn() && isCandidateColl();
+      allow create: if signedIn() && isCandidateColl() && candidateShape();
+      // No updates: candidates are write-once. Removes a whole abuse class.
+      allow delete: if signedIn() && isCandidateColl()
+        && (resource.data.ownerUid == request.auth.uid
+          || resource.data.roomOwnerUid == request.auth.uid
+          // Janitor: reap ICE older than 60min regardless of owner — covers
+          // late-arriving candidates written after the room was deleted.
+          || resource.data.createdAt < request.time - duration.value(60, 'm')
+          // Orphan ICE: parent room is gone, so anyone may reap. Owner
+          // deletes short-circuit first, so this exists() read only runs
+          // on the janitor path.
+          || (resource.data.keys().hasAll(['roomId'])
+            && !exists(/databases/$(database)/documents/connections/$(resource.data.roomId))));
+    }
+  }
+}

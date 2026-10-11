@@ -2,11 +2,14 @@
 
 import { useEffect, useRef, useState } from "react";
 import {
+  CameraOff,
   Loader2,
   MessageCircle,
   PhoneOff,
   Play,
+  RefreshCw,
   Send,
+  ShieldAlert,
   Shuffle,
   Signal,
   UserX,
@@ -45,7 +48,69 @@ export default function Home() {
       <DesktopView chat={chat} />
       <MobileView chat={chat} />
 
-      {/* Shared error modal */}
+      {/* Permission dialog: camera/mic blocked, with re-prompt */}
+      <Dialog
+        open={!!chat.permissionError}
+        onOpenChange={(o) => {
+          if (!o) chat.dismissPermissionError();
+        }}
+      >
+        <DialogContent className="border-white/10 bg-zinc-900 text-zinc-100">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-zinc-100">
+              {chat.permissionError?.kind === "no-device" ? (
+                <CameraOff className="size-4 text-amber-400" />
+              ) : (
+                <ShieldAlert className="size-4 text-amber-400" />
+              )}
+              {chat.permissionError?.title ?? "Permission needed"}
+            </DialogTitle>
+            <DialogDescription className="text-zinc-400">
+              {chat.permissionError?.message}
+            </DialogDescription>
+          </DialogHeader>
+          <details className="rounded-lg border border-white/10 bg-zinc-950/60 px-3 py-2 text-xs text-zinc-400">
+            <summary className="cursor-pointer font-medium text-zinc-200">
+              How to enable camera / mic
+            </summary>
+            <ul className="mt-2 list-disc space-y-1 pl-4">
+              <li>
+                Chrome (desktop): click the camera icon in the address bar
+                → Allow → reload.
+              </li>
+              <li>
+                Chrome (Android): tap the lock icon → Permissions → Camera /
+                Microphone → Allow.
+              </li>
+              <li>
+                Safari (iOS): Settings → Safari → Camera &amp; Microphone →
+                Allow. Then reload this page.
+              </li>
+              <li>
+                Firefox: click the camera icon in the address bar → Allow.
+              </li>
+            </ul>
+          </details>
+          <DialogFooter className="gap-2">
+            <Button
+              variant="ghost"
+              onClick={chat.dismissPermissionError}
+              className="text-zinc-300 hover:bg-white/10 hover:text-zinc-100"
+            >
+              Not now
+            </Button>
+            <Button
+              onClick={chat.retryPermissions}
+              className="gap-2 bg-emerald-500 text-zinc-950 hover:bg-emerald-400"
+            >
+              <RefreshCw className="size-4" />
+              Try again
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Shared error modal (connection failures offer a fresh retry) */}
       <Dialog
         open={!!chat.error}
         onOpenChange={(o) => {
@@ -62,16 +127,33 @@ export default function Home() {
               {chat.error}
             </DialogDescription>
           </DialogHeader>
-          <DialogFooter>
+          <DialogFooter className="gap-2">
             <Button
+              variant="ghost"
               onClick={chat.dismissError}
-              className="bg-emerald-500 text-zinc-950 hover:bg-emerald-400"
+              className="text-zinc-300 hover:bg-white/10 hover:text-zinc-100"
             >
-              OK
+              Dismiss
             </Button>
+            {chat.canRetryError && (
+              <Button
+                onClick={chat.retryConnection}
+                className="gap-2 bg-emerald-500 text-zinc-950 hover:bg-emerald-400"
+              >
+                <RefreshCw className="size-4" />
+                Try again
+              </Button>
+            )}
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* Transient rate-limit toast (auto-dismisses, no action needed) */}
+      {chat.notice && (
+        <div className="pointer-events-none absolute bottom-24 left-1/2 z-40 -translate-x-1/2 rounded-full border border-white/10 bg-zinc-900/95 px-4 py-2 text-xs font-medium text-zinc-200 shadow-xl backdrop-blur">
+          {chat.notice}
+        </div>
+      )}
     </div>
   );
 }
@@ -382,7 +464,7 @@ function DesktopView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
         <div className="mx-auto flex max-w-4xl items-center justify-end gap-3">
           {!started ? (
             <Button
-              onClick={chat.start}
+              onClick={() => chat.start()}
               size="lg"
               className="h-12 gap-2 rounded-xl bg-emerald-500 px-8 text-base font-semibold text-zinc-950 shadow-lg shadow-emerald-500/20 transition hover:bg-emerald-400"
             >
@@ -410,6 +492,10 @@ function DesktopView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
             </>
           )}
         </div>
+        <p className="mx-auto mt-2 max-w-4xl text-center text-[11px] text-zinc-600">
+          P2P call — matched strangers can see your public IP. Use a VPN if
+          you care.
+        </p>
       </footer>
     </div>
   );
@@ -623,7 +709,7 @@ function MobileView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
         ) : !started ? (
           <div className="p-3">
             <Button
-              onClick={chat.start}
+              onClick={() => chat.start()}
               className="h-12 w-full gap-2 rounded-xl bg-emerald-500 text-base font-semibold text-zinc-950 shadow-lg shadow-emerald-500/20 transition hover:bg-emerald-400"
             >
               <Play className="size-5 fill-current" />
@@ -662,6 +748,10 @@ function MobileView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
             </Button>
           </div>
         )}
+        <p className="px-3 pb-2 text-center text-[11px] text-zinc-600">
+          P2P call — matched strangers can see your public IP. Use a VPN if
+          you care.
+        </p>
       </div>
     </div>
   );
