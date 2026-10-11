@@ -1,62 +1,87 @@
-# VC App — WebRTC Learning Project
+# DiceCam — Random P2P Video Chat
 
 <p align="center">
-  <img src="Next/public/dicecam-logo.svg" alt="Dicecam" width="120" />
+  <img src="Next/public/dicecam-logo.svg" alt="DiceCam" width="120" />
 </p>
 
-This is a simple Omegle-like WebRTC learning project. It uses basic WebRTC APIs to establish a peer-to-peer connection between two users and Cloud Firestore as a minimal signaling & matchmaking backend.
+Omegle-style random video chat for fun. Peer-to-peer video/audio over WebRTC,
+text chat over an `RTCDataChannel`, Cloud Firestore as a minimal
+signaling & matchmaking backend. Built for sharing with friends — not a
+production product.
 
-Purpose and scope
-- Educational: built for learning WebRTC fundamentals (offer/answer, ICE candidates, data channels).
-- Signaling: Firestore is used as a lightweight signaling and matchmaking layer.
-- Not production-ready: a full Omegle-style product requires additional server-side infrastructure for moderation, monitoring, IP tracking, abuse prevention, and legal compliance — these are intentionally left out for this learning project.
+## Features
 
-Features
-- Simple P2P video between two peers.
-- Firestore-based signaling and matchmaking using a `connections` collection.
-- Live local preview on app load.
-- Start / Disconnect controls and basic UI placeholders.
-- Basic error handling with a modal and automatic cleanup on failures.
+- **Random matching** — Start, Next Person (Shuffle), Disconnect/Stop.
+- **P2P video + audio** (WebRTC) with local preview once you press Start.
+- **Text chat** over a data channel once connected.
+- **Camera / mic toggles** on your preview — both off = text-only mode.
+- **Face gate** (on-device MediaPipe BlazeFace, nothing leaves the browser):
+  warn pill after ~3s with no face, idle + "show your face" popup after ~6s.
+  Camera re-enable and fresh camera grants also require a visible face.
+- **First-open disclaimer** modal (notice + approve, remembered).
+- **Permission handling** — denied / busy / missing-device states each get
+  their own dialog with reprompt, plus a reload escape hatch.
+- **Resilience** — failed or timed-out connections auto-retry with a fresh
+  session (max 2, then an error dialog with manual retry).
+- **Signaling hygiene** — atomic room claims, background cleanup on leave,
+  sweep-on-start janitor for abandoned rooms, delayed ICE re-sweep.
 
-## Dicecam (Next.js)
+## Privacy notes (also shown in-app)
+
+- Calls are end-to-end, peer-to-peer. No personal data, footage, or messages
+  are stored or processed — Firestore only holds ephemeral signaling docs
+  (offers/answers/ICE) that are deleted on leave or swept when stale.
+- Your **public IP is visible to the matched stranger** (STUN/WebRTC
+  protocol). Use a VPN if you care.
+- Face detection runs 100% on-device; no video is sent anywhere for it.
+
+## DiceCam (Next.js)
 
 ```bash
 cd Next
 npm install
-npm run dev
+npm run dev   # http://localhost:3000
 ```
 
-Add your Firebase keys to `Next/.env.local` using `NEXT_PUBLIC_` prefix.
+Config: copy `Next/env.example` to `Next/.env` and fill from
+Firebase Console → Project settings:
 
-## Legacy prototype (Vanilla code)
+| Variable | Purpose |
+|---|---|
+| `NEXT_PUBLIC_FIREBASE_*` | App keys, project ID, collection (`connections` default) |
+| `NEXT_PUBLIC_RECAPTCHA_SITE_KEY` | Optional. Only needed if you enforce App Check |
+| `NEXT_PUBLIC_FIREBASE_APPCHECK_DEBUG` | Localhost only (`true` prints a debug token) |
 
-> ⚠️ Latest changes into the vanilla code were not tested due to the rewrite in Next.
+Firebase setup:
+1. **Authentication → Sign-in method → enable Anonymous.** (Without it,
+   sign-in fails with a 400 from `accounts:signUp` even with a valid key.)
+2. **Firestore → Rules tab → paste `Next/firestore.rules` → Publish.**
+   Scoped to the rooms collection + per-room ICE collections; anyone may
+   delete docs idle past the stale threshold (the janitor depends on this).
+3. One-time: wipe any pre-existing `connections` docs and stray
+   `*caller`/`*callee` collections (old docs lack `createdAt`, nothing can
+   match or reap them).
+4. Optional abuse hardening: reCAPTCHA v3 key → App Check → register app →
+   watch metrics → **Enforce** on Firestore. Client-side rate limits
+   (start/message/room-create) and shape-capped rules already ship.
 
 ```bash
-cd Vanilla\ code
-npm install
-npm run dev
+npm run build   # type-checked standalone build
+npm run lint
 ```
 
-Add your Firebase keys to `Vanilla code/.env` using `VITE_` prefix. Environment variables are read via `import.meta.env` (Vite). The Firestore collection name used for signaling is `connections` by default and can be changed with `VITE_FIREBASE_DB_COLLECTION`.
+## Legacy prototype (`Vanilla code/`)
 
----
+Archived and unused — kept for reference only. The Next.js app above is the
+real app. (`Vanilla code/firestore.rules` is superseded by
+`Next/firestore.rules`.)
 
-Notes
-- Anonymous sign-in must be enabled in Firebase Authentication -> Sign-in method. If it is disabled, the app will receive a 400 from `accounts:signUp` even if the API key is valid.
-- Firestore rules are in `Vanilla code/firestore.rules`.
+## Notes
 
-Security and privacy
-- This project stores ephemeral offers/answers and ICE candidates in Firestore for learning only. Do not use this implementation as-is for production: add proper auth, moderation, rate-limiting and data retention policies.
-- The app uses anonymous Firebase Auth. The goal is basic abuse prevention, not strong production security: authenticated users can still be misused if the app is shared publicly.
-
-Minimal abuse prevention
-- Enable anonymous authentication in Firebase Authentication.
-- Deploy the included `firestore.rules` file so only signed-in users can read/write the signaling data.
-- Keep room and ICE candidate payloads small; the rules cap offer/answer strings and candidate fields to modest sizes.
-- Room cleanup is owner-driven: the caller who created the room can delete the room doc plus both ICE candidate collections on disconnect.
-- If you later add real moderation or anti-abuse controls, move signaling to a server and add auth, logging, and cleanup policies there.
-
-This project began as a JavaScript-only learning challenge with the goal of understanding WebRTC fundamentals without relying on tutorials. The initial implementation focused on peer connection setup, SDP offer/answer exchange, ICE candidate propagation, and Firestore-based signaling.
-
-After the prototype successfully established peer-to-peer video connections, the project was refactored to TypeScript and received a redesigned user interface, anonymous Firebase authentication, improved error handling, and basic security rules.
+- The project began as a JavaScript-only WebRTC learning challenge
+  (offer/answer, ICE, data channels, Firestore signaling), then was
+  refactored to TypeScript with anonymous Firebase auth and a redesigned UI.
+- Fun-project scope: no TURN server (peer IPs visible, by design), no
+  server-side moderation, no hard per-user throttling — a modded client can
+  bypass the client-side gates. If strangers find the URL and abuse follows,
+  enforce App Check and consider moving signaling behind a server.
