@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   CameraOff,
+  Github,
   Loader2,
   MessageCircle,
   Mic,
@@ -35,6 +36,8 @@ import {
   type ChatStatus,
 } from "@/hooks/use-random-chat";
 import { useFaceGate } from "@/hooks/use-face-gate";
+
+const GITHUB_URL = "https://github.com/Shiyuki99/dicecam";
 
 export default function Home() {
   const chat = useRandomChat();
@@ -367,6 +370,18 @@ function DisclaimerDialog() {
           </li>
           <li>Enjoy — this is only for fun.</li>
         </ul>
+        <p className="text-xs text-zinc-500">
+          Want to check the code? It&apos;s on{" "}
+          <a
+            href={GITHUB_URL}
+            target="_blank"
+            rel="noreferrer"
+            className="text-emerald-400 underline hover:text-emerald-300"
+          >
+            GitHub
+          </a>
+          .
+        </p>
         <DialogFooter>
           <Button
             onClick={approve}
@@ -385,16 +400,36 @@ function DisclaimerDialog() {
 /* ------------------------------------------------------------------ */
 
 function FaceGate({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
-  // No camera, no gate: a disabled track feeds black frames to the detector.
-  const active =
-    chat.status === "connected" && !!chat.localStream && chat.cameraOn;
-  const handleTimeout = useCallback(() => {
-    chat.disconnect();
-  }, [chat.disconnect]);
+  // Track whenever the camera is live — connected or not. Live call with
+  // no face → idle + popup. Idle preview with no face → camera pauses
+  // itself (popup suppressed, toast explains) until a face is back.
+  const active = !!chat.localStream && chat.cameraOn;
+  const timeoutActionRef = useRef<() => void>(() => {});
+  const gateRef = useRef<(() => void) | null>(null);
+  useEffect(() => {
+    timeoutActionRef.current = () => {
+      if (chat.status === "connected") {
+        chat.disconnect();
+      } else {
+        gateRef.current?.();
+      }
+    };
+  });
+  const stableTimeout = useCallback(() => timeoutActionRef.current(), []);
   const gate = useFaceGate({
     stream: chat.localStream,
     active,
-    onTimeout: handleTimeout,
+    onTimeout: stableTimeout,
+  });
+  // Idle-path action, registered for the timeout above. The hook fires
+  // setFacePopup(true) just before onTimeout, so dismissing here batches
+  // the popup away (never flashes) while the toast explains the pause.
+  useEffect(() => {
+    gateRef.current = () => {
+      gate.dismissFacePopup();
+      void chat.setCameraEnabled(false);
+      chat.notify("Camera paused — show your face to turn it back on.");
+    };
   });
 
   const restart = () => {
@@ -472,7 +507,9 @@ function DeviceToggles({
     <div className="absolute bottom-2 right-2 z-10 flex gap-1.5">
       <button
         type="button"
-        onClick={() => chat.setCameraEnabled(!chat.cameraOn)}
+        onClick={() => {
+          void chat.setCameraEnabled(!chat.cameraOn);
+        }}
         title={chat.cameraOn ? "Turn camera off" : "Turn camera on"}
         aria-label={chat.cameraOn ? "Turn camera off" : "Turn camera on"}
         aria-pressed={!chat.cameraOn}
@@ -566,7 +603,19 @@ function DesktopView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
             <p className="text-xs text-zinc-500">Random video chat</p>
           </div>
         </div>
-        <StatusPill status={chat.status} channelOpen={chat.channelOpen} />
+        <div className="flex items-center gap-2">
+          <a
+            href={GITHUB_URL}
+            target="_blank"
+            rel="noreferrer"
+            aria-label="Open GitHub repo"
+            title="Open GitHub repo"
+            className="flex size-9 items-center justify-center rounded-xl border border-white/10 bg-white/5 text-zinc-400 transition hover:bg-white/10 hover:text-zinc-100 active:scale-95"
+          >
+            <Github className="size-4" />
+          </a>
+          <StatusPill status={chat.status} channelOpen={chat.channelOpen} />
+        </div>
       </header>
 
       <main className="relative min-h-0 flex-1 px-6 pb-3">
@@ -835,19 +884,31 @@ function MobileView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
             </div>
           )}
 
-          {/* Status chip (top-left) */}
-          <div
-            className={`absolute left-3 top-3 z-20 flex items-center gap-1.5 rounded-full bg-black/50 px-2.5 py-1 text-[11px] font-medium backdrop-blur ${c.text}`}
-          >
-            <span className="relative flex size-1.5">
-              {c.pulse && (
-                <span
-                  className={`absolute inline-flex h-full w-full animate-ping rounded-full opacity-75 ${c.dot}`}
-                />
-              )}
-              <span className={`relative inline-flex size-1.5 rounded-full ${c.dot}`} />
-            </span>
-            {c.label}
+          {/* Status chip (top-left) + repo link */}
+          <div className="absolute left-3 top-3 z-20 flex flex-col items-start gap-2">
+            <div
+              className={`flex items-center gap-1.5 rounded-full bg-black/50 px-2.5 py-1 text-[11px] font-medium backdrop-blur ${c.text}`}
+            >
+              <span className="relative flex size-1.5">
+                {c.pulse && (
+                  <span
+                    className={`absolute inline-flex h-full w-full animate-ping rounded-full opacity-75 ${c.dot}`}
+                  />
+                )}
+                <span className={`relative inline-flex size-1.5 rounded-full ${c.dot}`} />
+              </span>
+              {c.label}
+            </div>
+            <a
+              href={GITHUB_URL}
+              target="_blank"
+              rel="noreferrer"
+              aria-label="Open GitHub repo"
+              title="Open GitHub repo"
+              className="flex size-7 items-center justify-center rounded-full bg-black/50 text-zinc-400 backdrop-blur transition hover:text-zinc-100 active:scale-95"
+            >
+              <Github className="size-3.5" />
+            </a>
           </div>
 
           {/* Local camera PiP (top-right, small) */}

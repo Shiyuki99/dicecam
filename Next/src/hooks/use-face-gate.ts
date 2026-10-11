@@ -55,9 +55,44 @@ function getDetector(): Promise<FaceDetector> {
 
 interface FaceGateOpts {
   stream: MediaStream | null;
-  /** Gate only runs while true (e.g. status === "connected"). */
+  /** Gate only runs while true (e.g. camera on with a live stream). */
   active: boolean;
   onTimeout: () => void;
+}
+
+/**
+ * One-shot face check against a stream. true = face visible, false = none,
+ * null = detector unavailable (fail open so calls still work offline).
+ */
+export async function checkFaceOnce(
+  stream: MediaStream
+): Promise<boolean | null> {
+  let detector: FaceDetector;
+  try {
+    detector = await getDetector();
+  } catch {
+    return null;
+  }
+  const video = document.createElement("video");
+  video.muted = true;
+  (video as HTMLVideoElement & { playsInline?: boolean }).playsInline = true;
+  video.srcObject = stream;
+  try {
+    await video.play();
+    if (video.readyState < 2 || video.videoWidth === 0) return null;
+    return (
+      detector.detectForVideo(video, performance.now()).detections.length > 0
+    );
+  } catch {
+    return null;
+  } finally {
+    try {
+      video.pause();
+    } catch {
+      /* noop */
+    }
+    video.srcObject = null;
+  }
 }
 
 export function useFaceGate({ stream, active, onTimeout }: FaceGateOpts) {

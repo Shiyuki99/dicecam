@@ -22,6 +22,7 @@ import {
   type User,
 } from "firebase/auth";
 import { getFirebase, CONNECTIONS_COLLECTION } from "@/lib/firebase";
+import { checkFaceOnce } from "./use-face-gate";
 
 export type ChatStatus = "idle" | "searching" | "connected" | "peer-left";
 export type ChatRole = "caller" | "callee" | null;
@@ -341,6 +342,14 @@ export function useRandomChat() {
     [clearNoticeTimer]
   );
 
+  /** Public toast for UI-driven events (face gate, etc.). */
+  const notify = useCallback(
+    (text: string) => {
+      showNotice(text);
+    },
+    [showNotice]
+  );
+
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -639,12 +648,36 @@ export function useRandomChat() {
   }, []);
 
   const setCameraEnabled = useCallback(
-    (on: boolean) => {
-      cameraOnRef.current = on;
-      setCameraOn(on);
+    async (on: boolean) => {
+      if (!on) {
+        cameraOnRef.current = false;
+        setCameraOn(false);
+        applyDeviceToggles(localStreamRef.current);
+        return;
+      }
+      // Re-enabling requires a visible face first — no blind publishing.
+      const stream = localStreamRef.current;
+      if (
+        stream &&
+        stream.getVideoTracks().some((t) => t.readyState === "live")
+      ) {
+        let face: boolean | null = null;
+        try {
+          face = await checkFaceOnce(stream);
+        } catch {
+          face = null;
+        }
+        if (!mountedRef.current) return;
+        if (face === false) {
+          showNotice("Show your face to turn the camera on.");
+          return;
+        }
+      }
+      cameraOnRef.current = true;
+      setCameraOn(true);
       applyDeviceToggles(localStreamRef.current);
     },
-    [applyDeviceToggles]
+    [applyDeviceToggles, showNotice]
   );
 
   const setMicEnabled = useCallback(
@@ -698,6 +731,23 @@ export function useRandomChat() {
         audio: true,
         video: true,
       });
+      // Face-first: never publish video until a face is visible. Fail-open
+      // when the detector can't load so the call still works.
+      if (cameraOnRef.current) {
+        let face: boolean | null = null;
+        try {
+          face = await checkFaceOnce(stream);
+        } catch {
+          face = null;
+        }
+        if (face === false) {
+          cameraOnRef.current = false;
+          if (mountedRef.current) {
+            setCameraOn(false);
+            showNotice("Show your face to turn the camera on.");
+          }
+        }
+      }
       applyDeviceToggles(stream);
       localStreamRef.current = stream;
       if (mountedRef.current) setLocalStream(stream);
@@ -705,7 +755,7 @@ export function useRandomChat() {
     } catch (e) {
       throw e;
     }
-  }, [applyDeviceToggles, stopLocalStream]);
+  }, [applyDeviceToggles, stopLocalStream, showNotice]);
 
   /* ----------------------- Firestore signaling ---------------------------- */
   const trackActiveRoom = useCallback(
@@ -1442,6 +1492,7 @@ export function useRandomChat() {
     dismissPermissionError,
     retryPermissions,
     notice,
+    notify,
     cameraOn,
     micOn,
     setCameraEnabled,
