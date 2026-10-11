@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   CameraOff,
   Loader2,
@@ -8,6 +8,7 @@ import {
   PhoneOff,
   Play,
   RefreshCw,
+  ScanFace,
   Send,
   ShieldAlert,
   Shuffle,
@@ -30,6 +31,7 @@ import {
   useRandomChat,
   type ChatStatus,
 } from "@/hooks/use-random-chat";
+import { useFaceGate } from "@/hooks/use-face-gate";
 
 export default function Home() {
   const chat = useRandomChat();
@@ -154,6 +156,12 @@ export default function Home() {
           {chat.notice}
         </div>
       )}
+
+      {/* Face gate: single instance (both views stay mounted, one hidden) */}
+      <FaceGate chat={chat} />
+
+      {/* First-open disclaimer (blocks UI until approved) */}
+      <DisclaimerDialog />
     </div>
   );
 }
@@ -282,6 +290,152 @@ function RemoteOverlay({
     <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-zinc-950/40 px-6 text-center backdrop-blur-[2px]">
       {content}
     </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* First-open disclaimer (notice + approve, remembered)               */
+/* ------------------------------------------------------------------ */
+
+const DISCLAIMER_KEY = "dicecam-disclaimer-v1";
+
+function useDisclaimer() {
+  // Default closed on server prerender; effect opens it on mount if needed
+  // (avoids hydration mismatch).
+  const [show, setShow] = useState(false);
+  useEffect(() => {
+    try {
+      // Mount-gated localStorage read is the intended use of this pattern.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      if (localStorage.getItem(DISCLAIMER_KEY) !== "1") setShow(true);
+    } catch {
+      setShow(true);
+    }
+  }, []);
+  const approve = useCallback(() => {
+    try {
+      localStorage.setItem(DISCLAIMER_KEY, "1");
+    } catch {
+      /* private mode — popup returns next visit, harmless */
+    }
+    setShow(false);
+  }, []);
+  return { show, approve };
+}
+
+function DisclaimerDialog() {
+  const { show, approve } = useDisclaimer();
+  return (
+    <Dialog open={show}>
+      <DialogContent
+        showCloseButton={false}
+        onEscapeKeyDown={(e) => e.preventDefault()}
+        onPointerDownOutside={(e) => e.preventDefault()}
+        className="border-white/10 bg-zinc-900 text-zinc-100"
+      >
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2 text-zinc-100">
+            <ShieldAlert className="size-4 text-emerald-400" />
+            Before you start
+          </DialogTitle>
+          <DialogDescription className="text-zinc-400">
+            Quick notice — approve to continue.
+          </DialogDescription>
+        </DialogHeader>
+        <ul className="list-disc space-y-2 pl-5 text-sm text-zinc-300">
+          <li>
+            This website is not responsible for any content or behavior that
+            appears on it.
+          </li>
+          <li>
+            No personal data, info, or footage is stored or processed —
+            connections are end-to-end, peer-to-peer.
+          </li>
+          <li>
+            Your public IP is exposed by the STUN/WebRTC protocol — use a VPN
+            if you&apos;re a privacy guy (like 0xAim).
+          </li>
+          <li>Enjoy — this is only for fun.</li>
+        </ul>
+        <DialogFooter>
+          <Button
+            onClick={approve}
+            className="gap-2 bg-emerald-500 text-zinc-950 hover:bg-emerald-400"
+          >
+            Approve &amp; Continue
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Face gate (idle on no-face + "show your face" popup)               */
+/* ------------------------------------------------------------------ */
+
+function FaceGate({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
+  const active = chat.status === "connected" && !!chat.localStream;
+  const handleTimeout = useCallback(() => {
+    chat.disconnect();
+  }, [chat.disconnect]);
+  const gate = useFaceGate({
+    stream: chat.localStream,
+    active,
+    onTimeout: handleTimeout,
+  });
+
+  const restart = () => {
+    gate.dismissFacePopup();
+    void chat.start();
+  };
+
+  if (!gate.supported) return null;
+  return (
+    <>
+      {gate.warnSecs !== null && active && (
+        <div className="pointer-events-none absolute left-1/2 top-16 z-40 flex -translate-x-1/2 items-center gap-2 rounded-full border border-amber-500/30 bg-zinc-900/95 px-4 py-2 text-xs font-medium text-amber-200 shadow-xl backdrop-blur">
+          <ScanFace className="size-4" />
+          Show your face to stay connected ({gate.warnSecs}s)
+        </div>
+      )}
+
+      <Dialog
+        open={gate.facePopup}
+        onOpenChange={(o) => {
+          if (!o) gate.dismissFacePopup();
+        }}
+      >
+        <DialogContent className="border-white/10 bg-zinc-900 text-zinc-100">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-zinc-100">
+              <ScanFace className="size-4 text-amber-400" />
+              Show your face
+            </DialogTitle>
+            <DialogDescription className="text-zinc-400">
+              No face detected — you were idled. Show your face so you can
+              continue.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2">
+            <Button
+              variant="ghost"
+              onClick={gate.dismissFacePopup}
+              className="text-zinc-300 hover:bg-white/10 hover:text-zinc-100"
+            >
+              Not now
+            </Button>
+            <Button
+              onClick={restart}
+              className="gap-2 bg-emerald-500 text-zinc-950 hover:bg-emerald-400"
+            >
+              <Play className="size-4 fill-current" />
+              Start again
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
   );
 }
 

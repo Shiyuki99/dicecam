@@ -1167,6 +1167,11 @@ export function useRandomChat() {
         };
 
         // 1. Camera / mic permission & device failures → dedicated dialog.
+        // Match ONLY getUserMedia DOMException names (or our own __permKind
+        // flag). Never match on message text: Firestore denials say
+        // "Missing or insufficient permissions" and must NOT land here —
+        // that misclassification showed the camera-blocked popup right
+        // after the user granted access.
         const permNames = new Set([
           "NotAllowedError",
           "SecurityError",
@@ -1175,11 +1180,7 @@ export function useRandomChat() {
           "NotReadableError",
           "AbortError",
         ]);
-        if (
-          err?.__permKind ||
-          (err?.name && permNames.has(err.name)) ||
-          /permission|getusermedia|media/i.test(err?.message ?? "")
-        ) {
+        if (err?.__permKind || (err?.name && permNames.has(err.name))) {
           console.warn(
             "camera failed:",
             err?.name || err?.code || err?.message || err
