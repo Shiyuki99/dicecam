@@ -127,7 +127,7 @@ function classifyCameraError(e: unknown): PermissionErrorInfo {
         kind: "busy",
         title: "Camera is busy",
         message:
-          "The camera couldn't be started — usually another tab or app is holding it (a second DiceCam tab, Zoom, Teams, Discord, OBS), or the OS is blocking this browser. Close the other app/tab, check OS camera privacy settings, then try again.",
+          "The camera couldn't be started — usually another tab or app is holding it, or the OS is blocking this browser. Close the other app/tab, check OS camera privacy settings, then try again.",
         canReprompt: true,
       };
     default:
@@ -359,6 +359,7 @@ export function useRandomChat() {
 
   // Best-effort room delete on tab close. The async delete usually loses
   // the race with page unload — the sweep-on-start janitor covers the rest.
+  // pagehide fires more reliably than beforeunload (mobile, bfcache).
   useEffect(() => {
     const onUnload = () => {
       const ref = roomInfoRef.current.Ref;
@@ -374,7 +375,11 @@ export function useRandomChat() {
       }
     };
     window.addEventListener("beforeunload", onUnload);
-    return () => window.removeEventListener("beforeunload", onUnload);
+    window.addEventListener("pagehide", onUnload);
+    return () => {
+      window.removeEventListener("beforeunload", onUnload);
+      window.removeEventListener("pagehide", onUnload);
+    };
   }, []);
 
   /* ------------------------------ Messaging ------------------------------- */
@@ -647,6 +652,9 @@ export function useRandomChat() {
     });
   }, []);
 
+  const sleep = (ms: number) =>
+    new Promise<void>((resolve) => setTimeout(resolve, ms));
+
   const setCameraEnabled = useCallback(
     async (on: boolean) => {
       if (!on) {
@@ -655,12 +663,19 @@ export function useRandomChat() {
         applyDeviceToggles(localStreamRef.current);
         return;
       }
-      // Re-enabling requires a visible face first — no blind publishing.
       const stream = localStreamRef.current;
-      if (
-        stream &&
-        stream.getVideoTracks().some((t) => t.readyState === "live")
-      ) {
+      const hasLiveVideo =
+        !!stream &&
+        stream.getVideoTracks().some((t) => t.readyState === "live");
+      if (hasLiveVideo && stream) {
+        // Enable FIRST, then verify: a disabled track feeds black frames
+        // and no face can ever be detected on black — checking before
+        // enabling wedges the camera off forever.
+        cameraOnRef.current = true;
+        setCameraOn(true);
+        applyDeviceToggles(stream);
+        // Let real frames flow before judging (flip needs a beat).
+        await sleep(900);
         let face: boolean | null = null;
         try {
           face = await checkFaceOnce(stream);
@@ -669,9 +684,12 @@ export function useRandomChat() {
         }
         if (!mountedRef.current) return;
         if (face === false) {
+          cameraOnRef.current = false;
+          setCameraOn(false);
+          applyDeviceToggles(localStreamRef.current);
           showNotice("Show your face to turn the camera on.");
-          return;
         }
+        return;
       }
       cameraOnRef.current = true;
       setCameraOn(true);
@@ -704,12 +722,18 @@ export function useRandomChat() {
   }, []);
 
   const ensureCamera = useCallback(async () => {
-    // Drop cached streams whose tracks all ended (device slept, unplugged,
-    // OS revoked). Reusing them = black/broken video + confusing errors.
+    // Never trust a cached stream blindly. Drop it when tracks all ended
+    // (device slept, unplugged, revoked) OR when video tracks are all
+    // muted (OS privacy kill looks "live" but feeds black forever).
+    // Re-requesting surfaces the true current error instead of reusing
+    // a dead feed.
     const cached = localStreamRef.current;
     if (cached) {
-      const alive = cached.getTracks().some((t) => t.readyState === "live");
-      if (!alive) {
+      const tracks = cached.getTracks();
+      const anyLive = tracks.some((t) => t.readyState === "live");
+      const videos = cached.getVideoTracks();
+      const videoDead = videos.length > 0 && videos.every((t) => t.muted);
+      if (!anyLive || videoDead) {
         stopLocalStream();
       } else {
         applyDeviceToggles(cached);

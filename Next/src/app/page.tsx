@@ -19,6 +19,7 @@ import {
   UserX,
   Video,
   VideoOff,
+  Volume2,
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -453,13 +454,15 @@ function FaceGate({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
           if (!o) gate.dismissFacePopup();
         }}
       >
-        <DialogContent className="border-white/10 bg-zinc-900 text-zinc-100">
+        <DialogContent className="border-amber-500/40 bg-zinc-900 text-zinc-100 shadow-2xl shadow-amber-500/10 sm:max-w-md">
           <DialogHeader>
-            <DialogTitle className="flex items-center gap-2 text-zinc-100">
-              <ScanFace className="size-4 text-amber-400" />
+            <DialogTitle className="flex items-center gap-3 text-xl text-zinc-50">
+              <span className="flex size-11 shrink-0 animate-pulse items-center justify-center rounded-xl bg-amber-500/15 ring-1 ring-amber-500/40">
+                <ScanFace className="size-6 text-amber-300" />
+              </span>
               Show your face
             </DialogTitle>
-            <DialogDescription className="text-zinc-400">
+            <DialogDescription className="text-sm text-zinc-400">
               No face detected — you were idled. Show your face so you can
               continue.
             </DialogDescription>
@@ -544,14 +547,51 @@ function DesktopView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [draft, setDraft] = useState("");
+  // PC browsers often block play-with-audio on late-attached streams
+  // (autoplay policy) — explicit play() + tap fallback unlocks it.
+  const [audioBlocked, setAudioBlocked] = useState(false);
 
   useEffect(() => {
     if (localVideoRef.current) localVideoRef.current.srcObject = chat.localStream;
   }, [chat.localStream]);
 
   useEffect(() => {
-    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = chat.remoteStream;
+    const v = remoteVideoRef.current;
+    if (!v || !chat.remoteStream) return;
+    v.srcObject = chat.remoteStream;
+    let cancelled = false;
+    void (async () => {
+      try {
+        v.muted = false;
+        await v.play();
+        if (!cancelled) setAudioBlocked(false);
+      } catch {
+        if (!cancelled) setAudioBlocked(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [chat.remoteStream]);
+
+  const unblockAudio = () => {
+    const v = remoteVideoRef.current;
+    if (!v) return;
+    try {
+      v.muted = false;
+      const p = v.play() as unknown as Promise<void> | undefined;
+      if (p && typeof p.then === "function") {
+        p.then(
+          () => setAudioBlocked(false),
+          () => setAudioBlocked(true)
+        );
+      } else {
+        setAudioBlocked(false);
+      }
+    } catch {
+      setAudioBlocked(true);
+    }
+  };
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -723,6 +763,18 @@ function DesktopView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
                 playsInline
                 className="absolute inset-0 h-full w-full object-cover"
               />
+              {audioBlocked && chat.remoteStream && (
+                <button
+                  type="button"
+                  onClick={unblockAudio}
+                  className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-2 bg-zinc-950/70 backdrop-blur-sm transition hover:bg-zinc-950/60"
+                >
+                  <Volume2 className="size-8 text-emerald-400" />
+                  <span className="text-sm font-medium text-zinc-100">
+                    Tap for sound
+                  </span>
+                </button>
+              )}
               <RemoteOverlay status={chat.status} hasRemote={!!chat.remoteStream} />
             </div>
           </section>
@@ -783,6 +835,9 @@ function MobileView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
   const [stopArmed, setStopArmed] = useState(false);
   const [cover, setCover] = useState(true);
   const [showHint, setShowHint] = useState(true);
+  // Same autoplay-policy unlock as desktop (phones usually allow it,
+  // but a late-attached stream can still start muted).
+  const [audioBlocked, setAudioBlocked] = useState(false);
   const stopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -790,8 +845,42 @@ function MobileView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
   }, [chat.localStream]);
 
   useEffect(() => {
-    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = chat.remoteStream;
+    const v = remoteVideoRef.current;
+    if (!v || !chat.remoteStream) return;
+    v.srcObject = chat.remoteStream;
+    let cancelled = false;
+    void (async () => {
+      try {
+        v.muted = false;
+        await v.play();
+        if (!cancelled) setAudioBlocked(false);
+      } catch {
+        if (!cancelled) setAudioBlocked(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [chat.remoteStream]);
+
+  const unblockAudio = () => {
+    const v = remoteVideoRef.current;
+    if (!v) return;
+    try {
+      v.muted = false;
+      const p = v.play() as unknown as Promise<void> | undefined;
+      if (p && typeof p.then === "function") {
+        p.then(
+          () => setAudioBlocked(false),
+          () => setAudioBlocked(true)
+        );
+      } else {
+        setAudioBlocked(false);
+      }
+    } catch {
+      setAudioBlocked(true);
+    }
+  };
 
   useEffect(() => {
     return () => {
@@ -876,6 +965,22 @@ function MobileView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
             playsInline
             className={`absolute inset-0 h-full w-full ${cover ? "object-cover" : "object-contain"}`}
           />
+
+          {audioBlocked && chat.remoteStream && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                unblockAudio();
+              }}
+              className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-2 bg-zinc-950/70 backdrop-blur-sm"
+            >
+              <Volume2 className="size-8 text-emerald-400" />
+              <span className="text-sm font-medium text-zinc-100">
+                Tap for sound
+              </span>
+            </button>
+          )}
 
           {/* Brief hint on top of the camera */}
           {showHint && (

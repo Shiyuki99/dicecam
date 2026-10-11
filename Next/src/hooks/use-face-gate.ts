@@ -19,9 +19,9 @@ const WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_V
 const MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite";
 
-const SAMPLE_MS = 1_500;
-const WARN_AFTER_MISSES = 2; // ~3s continuous no-face → warn pill
-const KICK_AFTER_MISSES = 4; // ~6s continuous no-face → timeout
+const SAMPLE_MS = 1_000;
+const WARN_AFTER_MISSES = 3; // ~3s continuous no-face → warn pill
+const KICK_AFTER_MISSES = 6; // ~6s continuous no-face → timeout
 const SCORE_MIN = 0.5;
 
 // Singleton: heavy WASM + model load happens once, shared across calls.
@@ -53,6 +53,38 @@ function getDetector(): Promise<FaceDetector> {
   return detectorPromise;
 }
 
+/**
+ * Hidden scratch video for the detector. Attached to the DOM (invisible):
+ * mobile browsers throttle or starve fully detached video elements, so no
+ * frames ever flow and detection silently never runs.
+ */
+function makeHiddenVideo(): HTMLVideoElement {
+  const video = document.createElement("video");
+  video.muted = true;
+  video.setAttribute("muted", "");
+  video.setAttribute("playsinline", "");
+  (video as HTMLVideoElement & { playsInline?: boolean }).playsInline = true;
+  video.style.cssText =
+    "position:fixed;left:0;top:0;width:2px;height:2px;opacity:0;pointer-events:none;";
+  document.body.appendChild(video);
+  return video;
+}
+
+function releaseHiddenVideo(video: HTMLVideoElement | null) {
+  if (!video) return;
+  try {
+    video.pause();
+  } catch {
+    /* noop */
+  }
+  video.srcObject = null;
+  try {
+    video.remove();
+  } catch {
+    /* noop */
+  }
+}
+
 interface FaceGateOpts {
   stream: MediaStream | null;
   /** Gate only runs while true (e.g. camera on with a live stream). */
@@ -76,9 +108,7 @@ export async function checkFaceOnce(
   } catch {
     return null;
   }
-  const video = document.createElement("video");
-  video.muted = true;
-  (video as HTMLVideoElement & { playsInline?: boolean }).playsInline = true;
+  const video = makeHiddenVideo();
   video.srcObject = stream;
   const sleep = (ms: number) =>
     new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -114,12 +144,7 @@ export async function checkFaceOnce(
   } catch {
     return null;
   } finally {
-    try {
-      video.pause();
-    } catch {
-      /* noop */
-    }
-    video.srcObject = null;
+    releaseHiddenVideo(video);
   }
 }
 
@@ -152,9 +177,7 @@ export function useFaceGate({ stream, active, onTimeout }: FaceGateOpts) {
       }
       if (cancelled) return;
 
-      video = document.createElement("video");
-      video.muted = true;
-      (video as HTMLVideoElement & { playsInline?: boolean }).playsInline = true;
+      video = makeHiddenVideo();
       video.srcObject = stream;
       try {
         await video.play();
@@ -197,14 +220,7 @@ export function useFaceGate({ stream, active, onTimeout }: FaceGateOpts) {
       missesRef.current = 0;
       setWarnSecs(null);
       if (timer) clearInterval(timer);
-      if (video) {
-        try {
-          video.pause();
-        } catch {
-          /* noop */
-        }
-        video.srcObject = null;
-      }
+      releaseHiddenVideo(video);
       // Detector singleton is shared — never closed here.
     };
   }, [active, stream]);
