@@ -20,8 +20,8 @@ const MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite";
 
 const SAMPLE_MS = 1_500;
-const WARN_AFTER_MISSES = 4; // ~6s continuous no-face → warn pill
-const KICK_AFTER_MISSES = 8; // ~12s continuous no-face → timeout
+const WARN_AFTER_MISSES = 2; // ~3s continuous no-face → warn pill
+const KICK_AFTER_MISSES = 4; // ~6s continuous no-face → timeout
 const SCORE_MIN = 0.5;
 
 // Singleton: heavy WASM + model load happens once, shared across calls.

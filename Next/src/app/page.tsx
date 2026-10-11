@@ -5,6 +5,8 @@ import {
   CameraOff,
   Loader2,
   MessageCircle,
+  Mic,
+  MicOff,
   PhoneOff,
   Play,
   RefreshCw,
@@ -14,6 +16,7 @@ import {
   Shuffle,
   Signal,
   UserX,
+  Video,
   VideoOff,
   X,
 } from "lucide-react";
@@ -94,6 +97,13 @@ export default function Home() {
             </ul>
           </details>
           <DialogFooter className="gap-2">
+            <Button
+              variant="ghost"
+              onClick={() => window.location.reload()}
+              className="text-zinc-300 hover:bg-white/10 hover:text-zinc-100"
+            >
+              Reload page
+            </Button>
             <Button
               variant="ghost"
               onClick={chat.dismissPermissionError}
@@ -375,7 +385,9 @@ function DisclaimerDialog() {
 /* ------------------------------------------------------------------ */
 
 function FaceGate({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
-  const active = chat.status === "connected" && !!chat.localStream;
+  // No camera, no gate: a disabled track feeds black frames to the detector.
+  const active =
+    chat.status === "connected" && !!chat.localStream && chat.cameraOn;
   const handleTimeout = useCallback(() => {
     chat.disconnect();
   }, [chat.disconnect]);
@@ -436,6 +448,53 @@ function FaceGate({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
         </DialogContent>
       </Dialog>
     </>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Local device toggles (camera off / mic off / both = text-only)     */
+/* ------------------------------------------------------------------ */
+
+function DeviceToggles({
+  chat,
+  compact,
+}: {
+  chat: ReturnType<typeof useRandomChat>;
+  compact?: boolean;
+}) {
+  const btn = compact ? "size-6" : "size-8";
+  const icon = compact ? "size-3.5" : "size-4";
+  const on =
+    "border-white/10 bg-black/55 text-zinc-200 hover:bg-black/75";
+  const off =
+    "border-rose-500/50 bg-rose-500/25 text-rose-200 hover:bg-rose-500/35";
+  return (
+    <div className="absolute bottom-2 right-2 z-10 flex gap-1.5">
+      <button
+        type="button"
+        onClick={() => chat.setCameraEnabled(!chat.cameraOn)}
+        title={chat.cameraOn ? "Turn camera off" : "Turn camera on"}
+        aria-label={chat.cameraOn ? "Turn camera off" : "Turn camera on"}
+        aria-pressed={!chat.cameraOn}
+        className={`flex ${btn} items-center justify-center rounded-lg border backdrop-blur transition active:scale-95 ${chat.cameraOn ? on : off}`}
+      >
+        {chat.cameraOn ? (
+          <Video className={icon} />
+        ) : (
+          <VideoOff className={icon} />
+        )}
+      </button>
+      <button
+        type="button"
+        onClick={() => chat.setMicEnabled(!chat.micOn)}
+        title={chat.micOn ? "Mute microphone" : "Unmute microphone"}
+        aria-label={chat.micOn ? "Mute microphone" : "Unmute microphone"}
+        aria-pressed={!chat.micOn}
+        className={`flex ${btn} items-center justify-center rounded-lg border backdrop-blur transition active:scale-95 ${chat.micOn ? on : off}`}
+      >
+        {chat.micOn ? <Mic className={icon} /> : <MicOff className={icon} />}
+      </button>
+    </div>
   );
 }
 
@@ -526,9 +585,16 @@ function DesktopView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
                   <VideoOff className="size-6" />
                 </div>
               )}
+              {chat.localStream && !chat.cameraOn && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-zinc-950/80 text-zinc-500">
+                  <VideoOff className="size-6" />
+                  <span className="text-[10px] font-medium">Camera off</span>
+                </div>
+              )}
               <span className="absolute left-2 top-2 z-10 rounded-md bg-black/55 px-1.5 py-0.5 text-[10px] font-medium text-zinc-200 backdrop-blur">
                 You
               </span>
+              <DeviceToggles chat={chat} />
             </div>
 
             <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-white/10 bg-zinc-900/50 shadow-xl shadow-black/30 backdrop-blur">
@@ -799,9 +865,16 @@ function MobileView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
                   <VideoOff className="size-4" />
                 </div>
               )}
+              {chat.localStream && !chat.cameraOn && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center bg-zinc-950/80 text-zinc-500">
+                  <VideoOff className="size-4" />
+                  <span className="text-[8px] font-medium">Off</span>
+                </div>
+              )}
               <span className="absolute left-1 top-1 rounded bg-black/55 px-1 py-0.5 text-[9px] font-medium text-zinc-200 backdrop-blur">
                 You
               </span>
+              <DeviceToggles chat={chat} compact />
             </div>
           </div>
 

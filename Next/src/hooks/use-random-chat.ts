@@ -213,6 +213,12 @@ export function useRandomChat() {
     useState<PermissionErrorInfo | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [role, setRole] = useState<ChatRole>(null);
+  // Device toggles: track.enabled flips, no renegotiation needed.
+  // Camera off = audio + text continue; both off = text-only mode.
+  const [cameraOn, setCameraOn] = useState(true);
+  const [micOn, setMicOn] = useState(true);
+  const cameraOnRef = useRef(true);
+  const micOnRef = useRef(true);
 
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
@@ -620,8 +626,63 @@ export function useRandomChat() {
   }, []);
 
   /* ------------------------------- Camera --------------------------------- */
+  const applyDeviceToggles = useCallback((stream: MediaStream | null) => {
+    if (!stream) return;
+    const cam = cameraOnRef.current;
+    const mic = micOnRef.current;
+    stream.getVideoTracks().forEach((t) => {
+      t.enabled = cam;
+    });
+    stream.getAudioTracks().forEach((t) => {
+      t.enabled = mic;
+    });
+  }, []);
+
+  const setCameraEnabled = useCallback(
+    (on: boolean) => {
+      cameraOnRef.current = on;
+      setCameraOn(on);
+      applyDeviceToggles(localStreamRef.current);
+    },
+    [applyDeviceToggles]
+  );
+
+  const setMicEnabled = useCallback(
+    (on: boolean) => {
+      micOnRef.current = on;
+      setMicOn(on);
+      applyDeviceToggles(localStreamRef.current);
+    },
+    [applyDeviceToggles]
+  );
+
+  const stopLocalStream = useCallback(() => {
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((t) => {
+        try {
+          t.stop();
+        } catch {
+          /* noop */
+        }
+      });
+      localStreamRef.current = null;
+    }
+    if (mountedRef.current) setLocalStream(null);
+  }, []);
+
   const ensureCamera = useCallback(async () => {
-    if (localStreamRef.current) return localStreamRef.current;
+    // Drop cached streams whose tracks all ended (device slept, unplugged,
+    // OS revoked). Reusing them = black/broken video + confusing errors.
+    const cached = localStreamRef.current;
+    if (cached) {
+      const alive = cached.getTracks().some((t) => t.readyState === "live");
+      if (!alive) {
+        stopLocalStream();
+      } else {
+        applyDeviceToggles(cached);
+        return cached;
+      }
+    }
     if (typeof window === "undefined" || !navigator?.mediaDevices?.getUserMedia) {
       throw Object.assign(new Error("unsupported"), {
         __permKind: "unsupported" as PermissionKind,
@@ -637,13 +698,14 @@ export function useRandomChat() {
         audio: true,
         video: true,
       });
+      applyDeviceToggles(stream);
       localStreamRef.current = stream;
       if (mountedRef.current) setLocalStream(stream);
       return stream;
     } catch (e) {
       throw e;
     }
-  }, []);
+  }, [applyDeviceToggles, stopLocalStream]);
 
   /* ----------------------- Firestore signaling ---------------------------- */
   const trackActiveRoom = useCallback(
@@ -1289,8 +1351,11 @@ export function useRandomChat() {
   /** "Try again" for the permission dialog (re-prompts getUserMedia). */
   const retryPermissions = useCallback(() => {
     setPermissionError(null);
+    // Tear down any stale tracks first so the re-request is a truly fresh
+    // prompt — reusing a dead/old stream is what got users "stuck".
+    stopLocalStream();
     void start({ resetRetries: true, force: true });
-  }, [start]);
+  }, [start, stopLocalStream]);
 
   const nextPerson = useCallback(async () => {
     // Drop the current peer (keep the camera), then search again.
@@ -1377,6 +1442,10 @@ export function useRandomChat() {
     dismissPermissionError,
     retryPermissions,
     notice,
+    cameraOn,
+    micOn,
+    setCameraEnabled,
+    setMicEnabled,
     start,
     disconnect,
     nextPerson,
