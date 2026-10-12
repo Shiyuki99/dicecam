@@ -676,35 +676,44 @@ export function useRandomChat() {
       const target = pc ?? peerRef.current;
       if (!target) return;
       const video = localStreamRef.current?.getVideoTracks()[0] ?? null;
-      const jobs: Promise<void>[] = [];
-      target.getSenders().forEach((sender) => {
-        const t = sender.track;
-        // Senders we held have track === null; audio is never nulled.
-        if ((t && t.kind === "video") || t === null) {
-          try {
-            const r = sender.replaceTrack(on ? video : null) as unknown as
-              | Promise<void>
-              | undefined;
-            if (r && typeof r.then === "function") {
-              jobs.push(
-                r.then(
-                  () => {},
-                  () => {}
-                )
-              );
+      const holdOnce = () => {
+        const jobs: Promise<void>[] = [];
+        target.getSenders().forEach((sender) => {
+          const t = sender.track;
+          // Senders we held have track === null; audio is never nulled.
+          if ((t && t.kind === "video") || t === null) {
+            try {
+              const r = sender.replaceTrack(on ? video : null) as unknown as
+                | Promise<void>
+                | undefined;
+              if (r && typeof r.then === "function") {
+                jobs.push(
+                  r.then(
+                    () => {},
+                    () => {}
+                  )
+                );
+              }
+            } catch {
+              /* noop — verified below */
             }
-          } catch {
-            /* noop — verified below */
           }
-        }
-      });
-      await Promise.all(jobs);
+        });
+        return Promise.all(jobs);
+      };
+      await holdOnce();
       // Verify the hold actually landed; a failed null is a live leak.
-      if (!on) {
-        const leaking = target
+      // One retry before reporting — replaceTrack can lose a race.
+      const countLeaking = () =>
+        target
           .getSenders()
           .filter((s) => s.track && s.track.kind === "video").length;
-        console.info(`[rtc] video sending held (${leaking} leaking)`);
+      if (!on && countLeaking() > 0) {
+        await sleep(300);
+        await holdOnce();
+      }
+      if (!on) {
+        console.info(`[rtc] video sending held (${countLeaking()} leaking)`);
       }
     },
     []
@@ -751,7 +760,12 @@ export function useRandomChat() {
       }
       console.info("[face] enable-check:", face);
       if (!mountedRef.current || faceCheckSeqRef.current !== seq) return;
-      if (face === false) {
+      if (face === null) {
+        // Detector broken (not "no face") — opening anyway, but loudly,
+        // so a silently dead gate can never masquerade as a pass again.
+        console.warn("[face] detector unavailable — opening unverified");
+        showNotice("Face check unavailable — camera opened unverified.");
+      } else if (face === false) {
         cameraOnRef.current = false;
         setCameraOn(false);
         applyDeviceToggles(localStreamRef.current);
@@ -759,7 +773,7 @@ export function useRandomChat() {
         showNotice("Show your face to turn the camera on.");
         return;
       }
-      // Hit (or detector unavailable → fail open): resume outbound video.
+      // Hit: resume outbound video.
       await setPeerVideoSending(null, true);
     },
     [applyDeviceToggles, showNotice, setPeerVideoSending]
@@ -956,7 +970,12 @@ export function useRandomChat() {
           face = null;
         }
         console.info("[face] acquire-check:", face);
-        if (face === false) {
+        if (face === null) {
+          console.warn("[face] detector unavailable — opening unverified");
+          if (mountedRef.current) {
+            showNotice("Face check unavailable — camera opened unverified.");
+          }
+        } else if (face === false) {
           cameraOnRef.current = false;
           if (mountedRef.current) {
             setCameraOn(false);

@@ -22,7 +22,7 @@ const MODEL_URL =
 const SAMPLE_MS = 1_000;
 const WARN_AFTER_MISSES = 3; // ~3s continuous no-face → warn pill
 const KICK_AFTER_MISSES = 6; // ~6s continuous no-face → timeout
-const SCORE_MIN = 0.5;
+const SCORE_MIN = 0.6;
 
 // Singleton: heavy WASM + model load happens once, shared across calls.
 let detectorPromise: Promise<FaceDetector> | null = null;
@@ -96,8 +96,9 @@ interface FaceGateOpts {
  * One-shot face check against a stream. true = face visible, false = none,
  * null = detector unavailable (fail open so calls still work offline).
  *
- * Waits for real frames first (fresh grants need warm-up) and samples a few
- * frames: any positive allows. A single blind frame must never decide.
+ * Waits for real frames first (fresh grants need warm-up), then requires
+ * 2 of 3 samples positive: a single lucky frame must never open the
+ * camera, nor a single blind frame close it.
  */
 export async function checkFaceOnce(
   stream: MediaStream
@@ -125,22 +126,28 @@ export async function checkFaceOnce(
       await sleep(200);
     }
     if (!ready) return null;
-    // Sample up to 3 frames ~400ms apart; any face counts. Guards against
-    // one bad frame wrongly blocking (or wrongly allowing) the camera.
+    let positives = 0;
+    let top = 0;
     for (let i = 0; i < 3; i += 1) {
       if (i > 0) await sleep(400);
       try {
-        if (
-          detector.detectForVideo(video, performance.now()).detections.length >
+        const dets = detector.detectForVideo(video, performance.now())
+          .detections;
+        const best = dets.reduce(
+          (m, d) => Math.max(m, d.categories?.[0]?.score ?? 0),
           0
-        ) {
-          return true;
-        }
+        );
+        top = Math.max(top, best);
+        if (dets.length > 0) positives += 1;
       } catch {
         return null;
       }
     }
-    return false;
+    const result = positives >= 2;
+    console.info(
+      `[face] check: ${result} (${positives}/3 positive, top ${top.toFixed(2)})`
+    );
+    return result;
   } catch {
     return null;
   } finally {
