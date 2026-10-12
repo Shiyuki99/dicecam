@@ -189,6 +189,29 @@ export default function Home() {
 /* Shared helpers                                                      */
 /* ------------------------------------------------------------------ */
 
+// Attach a stream, or fully clear the element. Assigning srcObject = null
+// alone leaves the last frame painted (frozen ghost on disconnect) —
+// pause + drop src + load() resets to blank.
+function setVideoStream(v: HTMLVideoElement | null, stream: MediaStream | null) {
+  if (!v) return;
+  if (!stream) {
+    try {
+      v.pause();
+    } catch {
+      /* noop */
+    }
+    v.removeAttribute("src");
+    v.srcObject = null;
+    try {
+      v.load();
+    } catch {
+      /* noop */
+    }
+    return;
+  }
+  if (v.srcObject !== stream) v.srcObject = stream;
+}
+
 function statusConfig(status: ChatStatus, channelOpen: boolean) {
   switch (status) {
     case "idle":
@@ -624,13 +647,17 @@ function DesktopView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
   const [audioBlocked, setAudioBlocked] = useState(false);
 
   useEffect(() => {
-    if (localVideoRef.current) localVideoRef.current.srcObject = chat.localStream;
+    setVideoStream(localVideoRef.current, chat.localStream);
   }, [chat.localStream]);
 
   useEffect(() => {
     const v = remoteVideoRef.current;
-    if (!v || !chat.remoteStream) return;
-    v.srcObject = chat.remoteStream;
+    if (!v) return;
+    if (!chat.remoteStream) {
+      setVideoStream(v, null);
+      return;
+    }
+    setVideoStream(v, chat.remoteStream);
     let cancelled = false;
     void (async () => {
       try {
@@ -913,13 +940,17 @@ function MobileView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
   const stopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    if (localVideoRef.current) localVideoRef.current.srcObject = chat.localStream;
+    setVideoStream(localVideoRef.current, chat.localStream);
   }, [chat.localStream]);
 
   useEffect(() => {
     const v = remoteVideoRef.current;
-    if (!v || !chat.remoteStream) return;
-    v.srcObject = chat.remoteStream;
+    if (!v) return;
+    if (!chat.remoteStream) {
+      setVideoStream(v, null);
+      return;
+    }
+    setVideoStream(v, chat.remoteStream);
     let cancelled = false;
     void (async () => {
       try {

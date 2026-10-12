@@ -94,6 +94,8 @@ const SEND_WINDOW_MS = 10_000;
 const NOTICE_MS = 2_500; // transient rate-limit toast lifetime
 /** Janitor: reap open rooms idle this long; capped docs per sweep. */
 const STALE_OPEN_ROOM_MS = 10 * 60 * 1000;
+/** Janitor: reap claimed (matched) rooms idle this long. */
+const STALE_CLAIMED_ROOM_MS = 60 * 60 * 1000;
 const SWEEP_LIMIT = 10;
 /** Delayed ICE re-sweep catches late candidates from a dying remote peer. */
 const RESWEEP_DELAY_MS = 3_000;
@@ -442,17 +444,46 @@ export function useRandomChat() {
   );
 
   /**
-   * Janitor: reap abandoned open rooms (caller vanished before match) so
-   * tab-close / crash orphans die on the next visit instead of piling up.
-   * Capped per sweep; warn-only failures. Rules allow anyone to delete
-   * rooms idle past the stale threshold.
+   * Janitor: reap abandoned rooms so tab-close / crash orphans die on the
+   * next visit instead of piling up. Two passes — open rooms idle 10min
+   * (caller vanished before match) AND claimed rooms idle 60min (both
+   * sides gone). Capped per sweep; warn-only failures. Rules allow anyone
+   * to delete rooms idle past those thresholds.
    */
   const sweepStaleRooms = useCallback(async () => {
     const { db } = getFirebase();
     if (!db || !userRef.current) return;
-    let docs;
+    const now = Date.now();
+    const isStale = (
+      d: QueryDocumentSnapshot<DocumentData>,
+      maxAgeMs: number
+    ) => {
+      const ts = d.data()?.createdAt as { toMillis?: () => number } | undefined;
+      const ms = typeof ts?.toMillis === "function" ? ts.toMillis() : NaN;
+      return Number.isFinite(ms) && now - (ms as number) > maxAgeMs;
+    };
+    const reap = (docs: QueryDocumentSnapshot<DocumentData>[]) =>
+      Promise.all(
+        docs.map(async (d) => {
+          const data = d.data();
+          // Room first: once it's gone, anyone may reap its ICE (orphan rule).
+          try {
+            await deleteDoc(d.ref);
+          } catch {
+            return;
+          }
+          const rid = typeof data?.id === "string" ? (data.id as string) : null;
+          if (!rid) return;
+          try {
+            await deleteCollectionDocs(rid + "caller");
+            await deleteCollectionDocs(rid + "callee");
+          } catch {
+            /* late ICE dies on a later sweep / resweep */
+          }
+        })
+      );
     try {
-      docs = (
+      const open = (
         await getDocs(
           query(
             collection(db, CONNECTIONS_COLLECTION),
@@ -461,34 +492,22 @@ export function useRandomChat() {
           )
         )
       ).docs;
+      await reap(open.filter((d) => isStale(d, STALE_OPEN_ROOM_MS)));
+      // Single-field equality queries need no composite index — the age
+      // filter runs client-side.
+      const claimed = (
+        await getDocs(
+          query(
+            collection(db, CONNECTIONS_COLLECTION),
+            where("available", "==", false),
+            limit(SWEEP_LIMIT)
+          )
+        )
+      ).docs;
+      await reap(claimed.filter((d) => isStale(d, STALE_CLAIMED_ROOM_MS)));
     } catch {
-      return;
+      /* janitor best-effort */
     }
-    const now = Date.now();
-    const stale = docs.filter((d) => {
-      const ts = d.data()?.createdAt as { toMillis?: () => number } | undefined;
-      const ms = typeof ts?.toMillis === "function" ? ts.toMillis() : NaN;
-      return Number.isFinite(ms) && now - (ms as number) > STALE_OPEN_ROOM_MS;
-    });
-    await Promise.all(
-      stale.map(async (d) => {
-        const data = d.data();
-        // Room first: once it's gone, anyone may reap its ICE (orphan rule).
-        try {
-          await deleteDoc(d.ref);
-        } catch {
-          return;
-        }
-        const rid = typeof data?.id === "string" ? (data.id as string) : null;
-        if (!rid) return;
-        try {
-          await deleteCollectionDocs(rid + "caller");
-          await deleteCollectionDocs(rid + "callee");
-        } catch {
-          /* late ICE dies on a later sweep / resweep */
-        }
-      })
-    );
   }, [deleteCollectionDocs]);
 
   /* --------------------------- Peer teardown ------------------------------ */
@@ -1502,8 +1521,6 @@ export function useRandomChat() {
         lastStartAtRef.current = now;
         startTimesRef.current.push(now);
       }
-      // Janitor pass on every visit — keeps tab-close orphans from piling.
-      sweepStaleRooms().catch(() => {});
       clearRetryTimer();
       clearSearchTimer();
       dismissError();
@@ -1524,6 +1541,10 @@ export function useRandomChat() {
         if (sessionRef.current !== session || !mountedRef.current) return;
         await ensureCamera();
         if (sessionRef.current !== session || !mountedRef.current) return;
+
+        // Janitor pass, now authed — clears stale rooms right before we
+        // look for a match, so we never join a corpse.
+        sweepStaleRooms().catch(() => {});
 
         const peerConnection = await createPeer();
         if (sessionRef.current !== session || !mountedRef.current) {
