@@ -667,23 +667,45 @@ export function useRandomChat() {
    * the remote side gets nothing — used during face verification so no
    * real frame leaves before a check hits. Local preview and detector
    * keep running on the live track.
+   *
+   * AWAITED: resolves only after every replaceTrack lands (and verifies),
+   * so callers can rely on the hold before publishing anything.
    */
   const setPeerVideoSending = useCallback(
-    (pc: RTCPeerConnection | null, on: boolean) => {
+    async (pc: RTCPeerConnection | null, on: boolean): Promise<void> => {
       const target = pc ?? peerRef.current;
       if (!target) return;
       const video = localStreamRef.current?.getVideoTracks()[0] ?? null;
+      const jobs: Promise<void>[] = [];
       target.getSenders().forEach((sender) => {
         const t = sender.track;
         // Senders we held have track === null; audio is never nulled.
         if ((t && t.kind === "video") || t === null) {
           try {
-            void sender.replaceTrack(on ? video : null);
+            const r = sender.replaceTrack(on ? video : null) as unknown as
+              | Promise<void>
+              | undefined;
+            if (r && typeof r.then === "function") {
+              jobs.push(
+                r.then(
+                  () => {},
+                  () => {}
+                )
+              );
+            }
           } catch {
-            /* noop */
+            /* noop — verified below */
           }
         }
       });
+      await Promise.all(jobs);
+      // Verify the hold actually landed; a failed null is a live leak.
+      if (!on) {
+        const leaking = target
+          .getSenders()
+          .filter((s) => s.track && s.track.kind === "video").length;
+        console.info(`[rtc] video sending held (${leaking} leaking)`);
+      }
     },
     []
   );
@@ -695,7 +717,7 @@ export function useRandomChat() {
         cameraOnRef.current = false;
         setCameraOn(false);
         applyDeviceToggles(localStreamRef.current);
-        setPeerVideoSending(null, false);
+        await setPeerVideoSending(null, false);
         return;
       }
       const stream = localStreamRef.current;
@@ -708,15 +730,17 @@ export function useRandomChat() {
         setCameraOn(true);
         return;
       }
-      // Enable locally for preview + detector, but HOLD outbound video: a
-      // disabled track feeds black (undetectable), yet publishing real
-      // frames before a check hits is exactly what must not happen.
+      // 1. HOLD outbound first and wait until it lands — nothing leaves
+      //    from here on until a check explicitly resumes it.
       const seq = faceCheckSeqRef.current + 1;
       faceCheckSeqRef.current = seq;
       cameraOnRef.current = true;
       setCameraOn(true);
+      await setPeerVideoSending(null, false);
+      if (!mountedRef.current || faceCheckSeqRef.current !== seq) return;
+      // 2. Only now publish locally for preview + detector, then verify
+      //    on live frames (a disabled track feeds undetectable black).
       applyDeviceToggles(stream);
-      setPeerVideoSending(null, false);
       // Let real frames flow before judging (flip needs a beat).
       await sleep(900);
       let face: boolean | null = null;
@@ -731,12 +755,12 @@ export function useRandomChat() {
         cameraOnRef.current = false;
         setCameraOn(false);
         applyDeviceToggles(localStreamRef.current);
-        setPeerVideoSending(null, false);
+        await setPeerVideoSending(null, false);
         showNotice("Show your face to turn the camera on.");
         return;
       }
       // Hit (or detector unavailable → fail open): resume outbound video.
-      setPeerVideoSending(null, true);
+      await setPeerVideoSending(null, true);
     },
     [applyDeviceToggles, showNotice, setPeerVideoSending]
   );
@@ -855,6 +879,11 @@ export function useRandomChat() {
         });
         cur.addTrack(fresh);
         applyDeviceToggles(cur);
+        // A live swap replaces even a held (null) sender — re-hold when
+        // the camera is off so switching can't leak real frames.
+        if (kind === "video" && !cameraOnRef.current) {
+          await setPeerVideoSending(null, false);
+        }
         if (mountedRef.current) {
           setLocalStream(new MediaStream(cur.getTracks()));
           if (kind === "video") setActiveVideoDeviceId(deviceId);
@@ -866,7 +895,7 @@ export function useRandomChat() {
         return false;
       }
     },
-    [applyDeviceToggles, refreshDevices]
+    [applyDeviceToggles, refreshDevices, setPeerVideoSending]
   );
 
   // Keep the device pickers live as hardware is plugged/unplugged.
@@ -1285,17 +1314,30 @@ export function useRandomChat() {
     }
 
     // Never publish video while the camera is off or unverified: hold the
-    // video sender until a face check explicitly resumes it (no renegotiation).
+    // video sender until a face check explicitly resumes it. Awaited so
+    // the offer/answer that follows can only describe a held sender.
     if (!cameraOnRef.current) {
+      const holds: Promise<void>[] = [];
       peerConnection.getSenders().forEach((sender) => {
         if (sender.track && sender.track.kind === "video") {
           try {
-            void sender.replaceTrack(null);
+            const r = sender.replaceTrack(null) as unknown as
+              | Promise<void>
+              | undefined;
+            if (r && typeof r.then === "function") {
+              holds.push(
+                r.then(
+                  () => {},
+                  () => {}
+                )
+              );
+            }
           } catch {
             /* noop */
           }
         }
       });
+      await Promise.all(holds);
     }
 
     return peerConnection;
