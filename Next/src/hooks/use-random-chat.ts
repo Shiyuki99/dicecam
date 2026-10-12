@@ -660,47 +660,85 @@ export function useRandomChat() {
   const sleep = (ms: number) =>
     new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+  const faceCheckSeqRef = useRef(0);
+
+  /**
+   * Hold or resume outbound video WITHOUT renegotiation. While held (null),
+   * the remote side gets nothing — used during face verification so no
+   * real frame leaves before a check hits. Local preview and detector
+   * keep running on the live track.
+   */
+  const setPeerVideoSending = useCallback(
+    (pc: RTCPeerConnection | null, on: boolean) => {
+      const target = pc ?? peerRef.current;
+      if (!target) return;
+      const video = localStreamRef.current?.getVideoTracks()[0] ?? null;
+      target.getSenders().forEach((sender) => {
+        const t = sender.track;
+        // Senders we held have track === null; audio is never nulled.
+        if ((t && t.kind === "video") || t === null) {
+          try {
+            void sender.replaceTrack(on ? video : null);
+          } catch {
+            /* noop */
+          }
+        }
+      });
+    },
+    []
+  );
+
   const setCameraEnabled = useCallback(
     async (on: boolean) => {
       if (!on) {
+        faceCheckSeqRef.current += 1; // cancel any in-flight verify
         cameraOnRef.current = false;
         setCameraOn(false);
         applyDeviceToggles(localStreamRef.current);
+        setPeerVideoSending(null, false);
         return;
       }
       const stream = localStreamRef.current;
       const hasLiveVideo =
         !!stream &&
         stream.getVideoTracks().some((t) => t.readyState === "live");
-      if (hasLiveVideo && stream) {
-        // Enable FIRST, then verify: a disabled track feeds black frames
-        // and no face can ever be detected on black — checking before
-        // enabling wedges the camera off forever.
+      if (!hasLiveVideo || !stream) {
+        // No stream yet (pre-grant toggle): state only, acquire verifies.
         cameraOnRef.current = true;
         setCameraOn(true);
-        applyDeviceToggles(stream);
-        // Let real frames flow before judging (flip needs a beat).
-        await sleep(900);
-        let face: boolean | null = null;
-        try {
-          face = await checkFaceOnce(stream);
-        } catch {
-          face = null;
-        }
-        if (!mountedRef.current) return;
-        if (face === false) {
-          cameraOnRef.current = false;
-          setCameraOn(false);
-          applyDeviceToggles(localStreamRef.current);
-          showNotice("Show your face to turn the camera on.");
-        }
         return;
       }
+      // Enable locally for preview + detector, but HOLD outbound video: a
+      // disabled track feeds black (undetectable), yet publishing real
+      // frames before a check hits is exactly what must not happen.
+      const seq = faceCheckSeqRef.current + 1;
+      faceCheckSeqRef.current = seq;
       cameraOnRef.current = true;
       setCameraOn(true);
-      applyDeviceToggles(localStreamRef.current);
+      applyDeviceToggles(stream);
+      setPeerVideoSending(null, false);
+      // Let real frames flow before judging (flip needs a beat).
+      await sleep(900);
+      let face: boolean | null = null;
+      try {
+        face = await checkFaceOnce(stream);
+      } catch {
+        face = null;
+      }
+      console.info("[face] enable-check:", face);
+      if (!mountedRef.current || faceCheckSeqRef.current !== seq) return;
+      if (face === false) {
+        cameraOnRef.current = false;
+        setCameraOn(false);
+        applyDeviceToggles(localStreamRef.current);
+        setPeerVideoSending(null, false);
+        showNotice("Show your face to turn the camera on.");
+        return;
+      }
+      // Hit (or detector unavailable → fail open): resume outbound video.
+      setPeerVideoSending(null, true);
     },
-    [applyDeviceToggles, showNotice]
+    [applyDeviceToggles, showNotice, setPeerVideoSending]
   );
 
   const setMicEnabled = useCallback(
@@ -888,6 +926,7 @@ export function useRandomChat() {
         } catch {
           face = null;
         }
+        console.info("[face] acquire-check:", face);
         if (face === false) {
           cameraOnRef.current = false;
           if (mountedRef.current) {
@@ -1241,6 +1280,20 @@ export function useRandomChat() {
           peerConnection.addTrack(track, local);
         } catch {
           /* track may already be attached */
+        }
+      });
+    }
+
+    // Never publish video while the camera is off or unverified: hold the
+    // video sender until a face check explicitly resumes it (no renegotiation).
+    if (!cameraOnRef.current) {
+      peerConnection.getSenders().forEach((sender) => {
+        if (sender.track && sender.track.kind === "video") {
+          try {
+            void sender.replaceTrack(null);
+          } catch {
+            /* noop */
+          }
         }
       });
     }
