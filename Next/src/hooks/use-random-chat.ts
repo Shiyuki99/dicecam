@@ -49,6 +49,11 @@ export interface ChatMessage {
   ts: number;
 }
 
+export interface MediaDeviceOption {
+  deviceId: string;
+  label: string;
+}
+
 interface RoomInfo {
   Ref: DocumentReference | null;
   Id: string | null;
@@ -721,6 +726,122 @@ export function useRandomChat() {
     if (mountedRef.current) setLocalStream(null);
   }, []);
 
+  /* ------------------------- Device pick (re-grant) ------------------------ */
+  const [videoDevices, setVideoDevices] = useState<MediaDeviceOption[]>([]);
+  const [audioDevices, setAudioDevices] = useState<MediaDeviceOption[]>([]);
+  const [activeVideoDeviceId, setActiveVideoDeviceId] = useState<string | null>(
+    null
+  );
+  const [activeAudioDeviceId, setActiveAudioDeviceId] = useState<string | null>(
+    null
+  );
+  // Preferred devices survive across retries; picked in the permission
+  // dialog when the browser grabbed the wrong camera/mic.
+  const preferredVideoDeviceIdRef = useRef<string | null>(null);
+  const preferredAudioDeviceIdRef = useRef<string | null>(null);
+
+  const refreshDevices = useCallback(async () => {
+    try {
+      if (!navigator?.mediaDevices?.enumerateDevices) return;
+      const all = await navigator.mediaDevices.enumerateDevices();
+      const map = (kind: "videoinput" | "audioinput", fb: string) =>
+        all
+          .filter((d) => d.kind === kind)
+          .map((d, i) => ({
+            deviceId: d.deviceId,
+            label: d.label || `${fb} ${i + 1}`,
+          }));
+      if (!mountedRef.current) return;
+      setVideoDevices(map("videoinput", "Camera"));
+      setAudioDevices(map("audioinput", "Microphone"));
+    } catch {
+      /* enumeration unavailable — pickers stay hidden */
+    }
+  }, []);
+
+  /**
+   * Switch camera/mic, live if a stream is active (sender.replaceTrack, no
+   * renegotiation) or stored as preference for the next acquire when idle
+   * (e.g. picked from the busy dialog before retrying).
+   */
+  const switchDevice = useCallback(
+    async (kind: "video" | "audio", deviceId: string): Promise<boolean> => {
+      if (kind === "video") preferredVideoDeviceIdRef.current = deviceId;
+      else preferredAudioDeviceIdRef.current = deviceId;
+
+      const cur = localStreamRef.current;
+      if (!cur) return true; // preference stored; next acquire uses it
+      try {
+        const constraints: MediaStreamConstraints =
+          kind === "video"
+            ? { audio: false, video: { deviceId: { exact: deviceId } } }
+            : { audio: { deviceId: { exact: deviceId } }, video: false };
+        const ns = await navigator.mediaDevices.getUserMedia(constraints);
+        const fresh =
+          kind === "video" ? ns.getVideoTracks()[0] : ns.getAudioTracks()[0];
+        if (!fresh) {
+          ns.getTracks().forEach((t) => {
+            try {
+              t.stop();
+            } catch {
+              /* noop */
+            }
+          });
+          return false;
+        }
+        const olds =
+          kind === "video" ? cur.getVideoTracks() : cur.getAudioTracks();
+        const pc = peerRef.current;
+        if (pc) {
+          for (const sender of pc.getSenders()) {
+            if (sender.track && olds.includes(sender.track)) {
+              try {
+                await sender.replaceTrack(fresh);
+              } catch {
+                /* keep old track on failure */
+              }
+            }
+          }
+        }
+        olds.forEach((t) => {
+          try {
+            t.stop();
+          } catch {
+            /* noop */
+          }
+          try {
+            cur.removeTrack(t);
+          } catch {
+            /* noop */
+          }
+        });
+        cur.addTrack(fresh);
+        applyDeviceToggles(cur);
+        if (mountedRef.current) {
+          setLocalStream(new MediaStream(cur.getTracks()));
+          if (kind === "video") setActiveVideoDeviceId(deviceId);
+          else setActiveAudioDeviceId(deviceId);
+        }
+        void refreshDevices();
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [applyDeviceToggles, refreshDevices]
+  );
+
+  // Keep the device pickers live as hardware is plugged/unplugged.
+  useEffect(() => {
+    const md = navigator?.mediaDevices;
+    if (!md?.addEventListener) return;
+    const onChange = () => {
+      void refreshDevices();
+    };
+    md.addEventListener("devicechange", onChange);
+    return () => md.removeEventListener("devicechange", onChange);
+  }, [refreshDevices]);
+
   const ensureCamera = useCallback(async () => {
     // Never trust a cached stream blindly. Drop it when tracks all ended
     // (device slept, unplugged, revoked) OR when video tracks are all
@@ -751,10 +872,13 @@ export function useRandomChat() {
       });
     }
     try {
+      const preferredVideo = preferredVideoDeviceIdRef.current;
+      const preferredAudio = preferredAudioDeviceIdRef.current;
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: true,
+        audio: preferredAudio ? { deviceId: { exact: preferredAudio } } : true,
+        video: preferredVideo ? { deviceId: { exact: preferredVideo } } : true,
       });
+      // Remember what the browser actually opened (labels/ids for pickers).
       // Face-first: never publish video until a face is visible. Fail-open
       // when the detector can't load so the call still works.
       if (cameraOnRef.current) {
@@ -774,12 +898,19 @@ export function useRandomChat() {
       }
       applyDeviceToggles(stream);
       localStreamRef.current = stream;
-      if (mountedRef.current) setLocalStream(stream);
+      if (mountedRef.current) {
+        setLocalStream(stream);
+        const vId = stream.getVideoTracks()[0]?.getSettings().deviceId;
+        const aId = stream.getAudioTracks()[0]?.getSettings().deviceId;
+        if (typeof vId === "string") setActiveVideoDeviceId(vId);
+        if (typeof aId === "string") setActiveAudioDeviceId(aId);
+      }
+      void refreshDevices();
       return stream;
     } catch (e) {
       throw e;
     }
-  }, [applyDeviceToggles, stopLocalStream, showNotice]);
+  }, [applyDeviceToggles, stopLocalStream, showNotice, refreshDevices]);
 
   /* ----------------------- Firestore signaling ---------------------------- */
   const trackActiveRoom = useCallback(
@@ -1524,6 +1655,12 @@ export function useRandomChat() {
     micOn,
     setCameraEnabled,
     setMicEnabled,
+    videoDevices,
+    audioDevices,
+    activeVideoDeviceId,
+    activeAudioDeviceId,
+    refreshDevices,
+    switchDevice,
     start,
     disconnect,
     nextPerson,

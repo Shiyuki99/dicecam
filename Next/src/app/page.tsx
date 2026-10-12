@@ -42,6 +42,10 @@ const GITHUB_URL = "https://github.com/Shiyuki99/dicecam";
 
 export default function Home() {
   const chat = useRandomChat();
+  // Populate the device pickers whenever the permission dialog opens.
+  useEffect(() => {
+    if (chat.permissionError) void chat.refreshDevices();
+  }, [chat.permissionError, chat.refreshDevices]);
   return (
     <div className="relative h-[100dvh] overflow-hidden bg-zinc-950 text-zinc-100">
       {/* Ambient background glows */}
@@ -100,6 +104,7 @@ export default function Home() {
               </li>
             </ul>
           </details>
+          <PermissionDevicePickers chat={chat} />
           <DialogFooter className="gap-2">
             <Button
               variant="ghost"
@@ -393,6 +398,73 @@ function DisclaimerDialog() {
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Permission-dialog device pickers (wrong camera/mic re-grant)       */
+/* ------------------------------------------------------------------ */
+
+function PermissionDevicePickers({
+  chat,
+}: {
+  chat: ReturnType<typeof useRandomChat>;
+}) {
+  if (chat.videoDevices.length === 0 && chat.audioDevices.length === 0) {
+    return null;
+  }
+  const selectCls =
+    "mt-1 w-full rounded-lg border border-white/10 bg-zinc-950/60 px-2 py-1.5 text-xs text-zinc-200 focus:border-emerald-500/50 focus:outline-none";
+  const onPick = (kind: "video" | "audio", deviceId: string) => {
+    if (!deviceId) return;
+    void chat.switchDevice(kind, deviceId).then((ok) => {
+      if (!ok) chat.notify("Couldn't switch to that device.");
+    });
+  };
+  return (
+    <div className="space-y-2 rounded-lg border border-white/10 bg-zinc-950/60 px-3 py-2">
+      <p className="text-xs font-medium text-zinc-200">
+        Wrong camera or mic? Pick another, then hit Try again.
+      </p>
+      {chat.videoDevices.length > 0 && (
+        <label className="block text-xs text-zinc-400">
+          Camera
+          <select
+            value={chat.activeVideoDeviceId ?? ""}
+            onChange={(e) => onPick("video", e.target.value)}
+            className={selectCls}
+          >
+            <option value="" disabled>
+              Select camera…
+            </option>
+            {chat.videoDevices.map((d) => (
+              <option key={d.deviceId} value={d.deviceId}>
+                {d.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+      {chat.audioDevices.length > 0 && (
+        <label className="block text-xs text-zinc-400">
+          Microphone
+          <select
+            value={chat.activeAudioDeviceId ?? ""}
+            onChange={(e) => onPick("audio", e.target.value)}
+            className={selectCls}
+          >
+            <option value="" disabled>
+              Select microphone…
+            </option>
+            {chat.audioDevices.map((d) => (
+              <option key={d.deviceId} value={d.deviceId}>
+                {d.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+    </div>
   );
 }
 
