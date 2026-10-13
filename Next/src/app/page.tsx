@@ -212,6 +212,40 @@ function setVideoStream(v: HTMLVideoElement | null, stream: MediaStream | null) 
   if (v.srcObject !== stream) v.srcObject = stream;
 }
 
+// Any user gesture (Start tap included) counts toward the autoplay policy,
+// so retry remote playback on every tap/keypress — the lock usually
+// releases long before the overlay is ever needed (it stays as fallback).
+function useRemoteAudioUnlock(
+  ref: React.RefObject<HTMLVideoElement | null>,
+  stream: MediaStream | null,
+  setBlocked: (b: boolean) => void
+) {
+  useEffect(() => {
+    const unlock = () => {
+      const v = ref.current;
+      if (!v || !stream) return;
+      try {
+        v.muted = false;
+        const p = v.play() as unknown as Promise<void> | undefined;
+        if (p && typeof p.then === "function") {
+          p.then(
+            () => setBlocked(false),
+            () => {}
+          );
+        }
+      } catch {
+        /* overlay stays */
+      }
+    };
+    window.addEventListener("pointerdown", unlock);
+    window.addEventListener("keydown", unlock);
+    return () => {
+      window.removeEventListener("pointerdown", unlock);
+      window.removeEventListener("keydown", unlock);
+    };
+  }, [ref, stream, setBlocked]);
+}
+
 function statusConfig(status: ChatStatus, channelOpen: boolean) {
   switch (status) {
     case "idle":
@@ -680,6 +714,7 @@ function DesktopView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
   // PC browsers often block play-with-audio on late-attached streams
   // (autoplay policy) — explicit play() + tap fallback unlocks it.
   const [audioBlocked, setAudioBlocked] = useState(false);
+  useRemoteAudioUnlock(remoteVideoRef, chat.remoteStream, setAudioBlocked);
 
   // Camera off detaches the preview entirely (black element, not a live
   // feed under the overlay) so "off" reads as off.
@@ -996,6 +1031,7 @@ function MobileView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
   // Same autoplay-policy unlock as desktop (phones usually allow it,
   // but a late-attached stream can still start muted).
   const [audioBlocked, setAudioBlocked] = useState(false);
+  useRemoteAudioUnlock(remoteVideoRef, chat.remoteStream, setAudioBlocked);
   const stopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Same as desktop: camera off detaches the preview entirely.
