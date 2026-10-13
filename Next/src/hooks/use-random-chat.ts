@@ -220,6 +220,7 @@ export function useRandomChat() {
   const [permissionError, setPermissionError] =
     useState<PermissionErrorInfo | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [faceEnablePrompt, setFaceEnablePrompt] = useState(false);
   const [role, setRole] = useState<ChatRole>(null);
   // Device toggles: track.enabled flips, no renegotiation needed.
   // Camera off = audio + text continue; both off = text-only mode.
@@ -739,11 +740,12 @@ export function useRandomChat() {
         console.warn("[face] detector unavailable — opening unverified");
         showNotice("Face check unavailable — camera opened unverified.");
       } else if (face === false) {
-        showNotice("Show your face to turn the camera on.");
+        if (mountedRef.current) setFaceEnablePrompt(true);
         return;
       }
       cameraOnRef.current = true;
       setCameraOn(true);
+      setFaceEnablePrompt(false);
       applyDeviceToggles(localStreamRef.current);
     },
     [applyDeviceToggles, showNotice]
@@ -1011,7 +1013,7 @@ export function useRandomChat() {
           cameraOnRef.current = false;
           if (mountedRef.current) {
             setCameraOn(false);
-            showNotice("Show your face to turn the camera on.");
+            setFaceEnablePrompt(true);
           }
         }
       }
@@ -1513,6 +1515,7 @@ export function useRandomChat() {
       if (resetRetries) {
         retryCountRef.current = 0;
         setPermissionError(null);
+        setFaceEnablePrompt(false);
       }
       setMessages([]);
       setStatus("searching");
@@ -1677,6 +1680,11 @@ export function useRandomChat() {
     void start({ resetRetries: true, force: true });
   }, [dismissError, start]);
 
+  const dismissFaceEnablePrompt = useCallback(
+    () => setFaceEnablePrompt(false),
+    []
+  );
+
   /** "Try again" for the permission dialog (re-prompts getUserMedia). */
   const retryPermissions = useCallback(() => {
     setPermissionError(null);
@@ -1780,6 +1788,8 @@ export function useRandomChat() {
     retryPermissions,
     notice,
     notify,
+    faceEnablePrompt,
+    dismissFaceEnablePrompt,
     cameraOn,
     micOn,
     setCameraEnabled,

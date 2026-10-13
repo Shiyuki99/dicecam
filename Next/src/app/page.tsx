@@ -580,6 +580,35 @@ function FaceGate({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <Dialog
+        open={chat.faceEnablePrompt}
+        onOpenChange={(o) => {
+          if (!o) chat.dismissFaceEnablePrompt();
+        }}
+      >
+        <DialogContent className="border-amber-500/40 bg-zinc-900 text-zinc-100 shadow-2xl shadow-amber-500/10 sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-3 text-xl text-zinc-50">
+              <span className="flex size-11 shrink-0 animate-pulse items-center justify-center rounded-xl bg-amber-500/15 ring-1 ring-amber-500/40">
+                <ScanFace className="size-6 text-amber-300" />
+              </span>
+              Show your face
+            </DialogTitle>
+            <DialogDescription className="text-sm text-zinc-400">
+              Please show your face to enable the camera.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              onClick={chat.dismissFaceEnablePrompt}
+              className="gap-2 bg-emerald-500 text-zinc-950 hover:bg-emerald-400"
+            >
+              Got it
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </>
   );
 }
@@ -605,7 +634,10 @@ function DeviceToggles({
     <div className="absolute bottom-2 right-2 z-10 flex gap-1.5">
       <button
         type="button"
-        onClick={() => {
+        onClick={(e) => {
+          // Don't bubble to the stage's zoom toggle (mobile): tapping a
+          // device button must never flip the video fit.
+          e.stopPropagation();
           void chat.setCameraEnabled(!chat.cameraOn);
         }}
         title={chat.cameraOn ? "Turn camera off" : "Turn camera on"}
@@ -621,7 +653,10 @@ function DeviceToggles({
       </button>
       <button
         type="button"
-        onClick={() => chat.setMicEnabled(!chat.micOn)}
+        onClick={(e) => {
+          e.stopPropagation();
+          chat.setMicEnabled(!chat.micOn);
+        }}
         title={chat.micOn ? "Mute microphone" : "Unmute microphone"}
         aria-label={chat.micOn ? "Mute microphone" : "Unmute microphone"}
         aria-pressed={!chat.micOn}
@@ -646,9 +681,14 @@ function DesktopView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
   // (autoplay policy) — explicit play() + tap fallback unlocks it.
   const [audioBlocked, setAudioBlocked] = useState(false);
 
+  // Camera off detaches the preview entirely (black element, not a live
+  // feed under the overlay) so "off" reads as off.
   useEffect(() => {
-    setVideoStream(localVideoRef.current, chat.localStream);
-  }, [chat.localStream]);
+    setVideoStream(
+      localVideoRef.current,
+      chat.cameraOn ? chat.localStream : null
+    );
+  }, [chat.localStream, chat.cameraOn]);
 
   useEffect(() => {
     const v = remoteVideoRef.current;
@@ -699,24 +739,43 @@ function DesktopView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
   const started = chat.status !== "idle";
   const canChat = chat.channelOpen && chat.status === "connected";
 
-  // Global desktop shortcuts: Enter = next, Escape = disconnect.
-  // Ignored while typing in the chat input so Enter can send messages.
+  // Global desktop shortcuts: double Enter = next (first arms, second
+  // within 2s skips), Escape = disconnect. Ignored while typing in the
+  // chat input so Enter can send messages.
+  const nextArmedRef = useRef(false);
+  const nextArmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
-    if (!started) return;
+    if (!started) {
+      nextArmedRef.current = false;
+      return;
+    }
     const handler = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
       if (e.key === "Enter") {
         e.preventDefault();
-        chat.nextPerson();
+        if (nextArmedRef.current) {
+          nextArmedRef.current = false;
+          if (nextArmTimerRef.current) clearTimeout(nextArmTimerRef.current);
+          void chat.nextPerson();
+        } else {
+          nextArmedRef.current = true;
+          chat.notify("Press Enter again to skip.");
+          nextArmTimerRef.current = setTimeout(() => {
+            nextArmedRef.current = false;
+          }, 2000);
+        }
       } else if (e.key === "Escape") {
         e.preventDefault();
         chat.disconnect();
       }
     };
     window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [started, chat.nextPerson, chat.disconnect]);
+    return () => {
+      window.removeEventListener("keydown", handler);
+      if (nextArmTimerRef.current) clearTimeout(nextArmTimerRef.current);
+    };
+  }, [started, chat.nextPerson, chat.disconnect, chat.notify]);
 
   const onSend = () => {
     if (chat.sendMessage(draft)) setDraft("");
@@ -939,9 +998,13 @@ function MobileView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
   const [audioBlocked, setAudioBlocked] = useState(false);
   const stopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Same as desktop: camera off detaches the preview entirely.
   useEffect(() => {
-    setVideoStream(localVideoRef.current, chat.localStream);
-  }, [chat.localStream]);
+    setVideoStream(
+      localVideoRef.current,
+      chat.cameraOn ? chat.localStream : null
+    );
+  }, [chat.localStream, chat.cameraOn]);
 
   useEffect(() => {
     const v = remoteVideoRef.current;
