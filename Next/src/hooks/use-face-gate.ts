@@ -126,10 +126,13 @@ export async function checkFaceOnce(
       await sleep(200);
     }
     if (!ready) return null;
+    // Up to 6 samples ~500ms apart (~3s window), 2 positives to pass.
+    // A face wandering into frame a second or two late must still pass,
+    // while a single lucky frame can never open the camera alone.
     let positives = 0;
     let top = 0;
-    for (let i = 0; i < 3; i += 1) {
-      if (i > 0) await sleep(400);
+    for (let i = 0; i < 6; i += 1) {
+      if (i > 0) await sleep(500);
       try {
         const dets = detector.detectForVideo(video, performance.now())
           .detections;
@@ -138,16 +141,21 @@ export async function checkFaceOnce(
           0
         );
         top = Math.max(top, best);
-        if (dets.length > 0) positives += 1;
+        if (dets.length > 0) {
+          positives += 1;
+          if (positives >= 2) {
+            console.info(
+              `[face] check: true (${positives}/6 positive, top ${top.toFixed(2)})`
+            );
+            return true;
+          }
+        }
       } catch {
         return null;
       }
     }
-    const result = positives >= 2;
-    console.info(
-      `[face] check: ${result} (${positives}/3 positive, top ${top.toFixed(2)})`
-    );
-    return result;
+    console.info(`[face] check: false (${positives}/6 positive, top ${top.toFixed(2)})`);
+    return false;
   } catch {
     return null;
   } finally {
@@ -160,6 +168,7 @@ export function useFaceGate({ stream, active, onTimeout }: FaceGateOpts) {
   const [warnSecs, setWarnSecs] = useState<number | null>(null);
   const [facePopup, setFacePopup] = useState(false);
   const missesRef = useRef(0);
+  const warmupRef = useRef(0);
   const onTimeoutRef = useRef(onTimeout);
 
   useEffect(() => {
@@ -193,9 +202,17 @@ export function useFaceGate({ stream, active, onTimeout }: FaceGateOpts) {
       }
       if (cancelled) return;
 
+      // Fresh activation grace: the first few ticks may run on warming-up
+      // frames — never count those as misses (no instant-kick on connect).
+      warmupRef.current = 3;
+
       timer = setInterval(() => {
         if (cancelled || !video) return;
         if (video.readyState < 2 || video.videoWidth === 0) return;
+        if (warmupRef.current > 0) {
+          warmupRef.current -= 1;
+          return;
+        }
         let hasFace = false;
         try {
           hasFace = detector.detectForVideo(video, performance.now()).detections.length > 0;

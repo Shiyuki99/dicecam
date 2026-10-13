@@ -230,6 +230,9 @@ export function useRandomChat() {
 
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
+  // Peer-bound video ORIGINAL (enabled only when on + verified). Preview
+  // + detector run on a live clone inside localStream.
+  const peerVideoTrackRef = useRef<MediaStreamTrack | null>(null);
   const channelRef = useRef<RTCDataChannel | null>(null);
   const userRef = useRef<User | null>(null);
   const authReadyRef = useRef(false);
@@ -371,6 +374,8 @@ export function useRandomChat() {
     const onUnload = () => {
       const ref = roomInfoRef.current.Ref;
       if (ref) deleteDoc(ref).catch(() => {});
+      // Inline (not stopLocalStream — declared below): unload must release
+      // preview clone AND peer original or the camera light stays on.
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach((t) => {
           try {
@@ -379,6 +384,13 @@ export function useRandomChat() {
             /* noop */
           }
         });
+      }
+      if (peerVideoTrackRef.current) {
+        try {
+          peerVideoTrackRef.current.stop();
+        } catch {
+          /* noop */
+        }
       }
     };
     window.addEventListener("beforeunload", onUnload);
@@ -664,14 +676,17 @@ export function useRandomChat() {
   }, []);
 
   /* ------------------------------- Camera --------------------------------- */
+  // Track model: the peer-bound video ORIGINAL is enabled only while the
+  // camera is on AND verified — disabled means black frames flow (clean
+  // "camera off", never a frozen frame, no sender surgery, no races).
+  // Preview + detector run on a live CLONE in localStream, covered by the
+  // "Camera off" overlay whenever cameraOn is false.
   const applyDeviceToggles = useCallback((stream: MediaStream | null) => {
-    if (!stream) return;
     const cam = cameraOnRef.current;
     const mic = micOnRef.current;
-    stream.getVideoTracks().forEach((t) => {
-      t.enabled = cam;
-    });
-    stream.getAudioTracks().forEach((t) => {
+    const peerVideo = peerVideoTrackRef.current;
+    if (peerVideo && peerVideo.readyState === "live") peerVideo.enabled = cam;
+    stream?.getAudioTracks().forEach((t) => {
       t.enabled = mic;
     });
   }, []);
@@ -681,96 +696,35 @@ export function useRandomChat() {
 
   const faceCheckSeqRef = useRef(0);
 
-  /**
-   * Hold or resume outbound video WITHOUT renegotiation. While held (null),
-   * the remote side gets nothing — used during face verification so no
-   * real frame leaves before a check hits. Local preview and detector
-   * keep running on the live track.
-   *
-   * AWAITED: resolves only after every replaceTrack lands (and verifies),
-   * so callers can rely on the hold before publishing anything.
-   */
-  const setPeerVideoSending = useCallback(
-    async (pc: RTCPeerConnection | null, on: boolean): Promise<void> => {
-      const target = pc ?? peerRef.current;
-      if (!target) return;
-      const video = localStreamRef.current?.getVideoTracks()[0] ?? null;
-      const holdOnce = () => {
-        const jobs: Promise<void>[] = [];
-        target.getSenders().forEach((sender) => {
-          const t = sender.track;
-          // Senders we held have track === null; audio is never nulled.
-          if ((t && t.kind === "video") || t === null) {
-            try {
-              const r = sender.replaceTrack(on ? video : null) as unknown as
-                | Promise<void>
-                | undefined;
-              if (r && typeof r.then === "function") {
-                jobs.push(
-                  r.then(
-                    () => {},
-                    () => {}
-                  )
-                );
-              }
-            } catch {
-              /* noop — verified below */
-            }
-          }
-        });
-        return Promise.all(jobs);
-      };
-      await holdOnce();
-      // Verify the hold actually landed; a failed null is a live leak.
-      // One retry before reporting — replaceTrack can lose a race.
-      const countLeaking = () =>
-        target
-          .getSenders()
-          .filter((s) => s.track && s.track.kind === "video").length;
-      if (!on && countLeaking() > 0) {
-        await sleep(300);
-        await holdOnce();
-      }
-      if (!on) {
-        console.info(`[rtc] video sending held (${countLeaking()} leaking)`);
-      }
-    },
-    []
-  );
-
   const setCameraEnabled = useCallback(
     async (on: boolean) => {
       if (!on) {
         faceCheckSeqRef.current += 1; // cancel any in-flight verify
         cameraOnRef.current = false;
         setCameraOn(false);
+        // Peer original goes dark = clean black "camera off" (no freeze,
+        // no sender surgery). Preview clone keeps running underneath.
         applyDeviceToggles(localStreamRef.current);
-        await setPeerVideoSending(null, false);
         return;
       }
       const stream = localStreamRef.current;
-      const hasLiveVideo =
+      const peerAlive =
+        !!peerVideoTrackRef.current &&
+        peerVideoTrackRef.current.readyState === "live";
+      const cloneLive =
         !!stream &&
         stream.getVideoTracks().some((t) => t.readyState === "live");
-      if (!hasLiveVideo || !stream) {
-        // No stream yet (pre-grant toggle): state only, acquire verifies.
+      if (!stream || !cloneLive || !peerAlive) {
+        // No live preview (pre-grant / torn down): state only, acquire
+        // verifies before anything is published.
         cameraOnRef.current = true;
         setCameraOn(true);
         return;
       }
-      // 1. HOLD outbound first and wait until it lands — nothing leaves
-      //    from here on until a check explicitly resumes it.
+      // Verify on the always-live preview clone while the peer original
+      // stays dark. Hit → original lights up; miss → it never did.
       const seq = faceCheckSeqRef.current + 1;
       faceCheckSeqRef.current = seq;
-      cameraOnRef.current = true;
-      setCameraOn(true);
-      await setPeerVideoSending(null, false);
-      if (!mountedRef.current || faceCheckSeqRef.current !== seq) return;
-      // 2. Only now publish locally for preview + detector, then verify
-      //    on live frames (a disabled track feeds undetectable black).
-      applyDeviceToggles(stream);
-      // Let real frames flow before judging (flip needs a beat).
-      await sleep(900);
       let face: boolean | null = null;
       try {
         face = await checkFaceOnce(stream);
@@ -785,17 +739,14 @@ export function useRandomChat() {
         console.warn("[face] detector unavailable — opening unverified");
         showNotice("Face check unavailable — camera opened unverified.");
       } else if (face === false) {
-        cameraOnRef.current = false;
-        setCameraOn(false);
-        applyDeviceToggles(localStreamRef.current);
-        await setPeerVideoSending(null, false);
         showNotice("Show your face to turn the camera on.");
         return;
       }
-      // Hit: resume outbound video.
-      await setPeerVideoSending(null, true);
+      cameraOnRef.current = true;
+      setCameraOn(true);
+      applyDeviceToggles(localStreamRef.current);
     },
-    [applyDeviceToggles, showNotice, setPeerVideoSending]
+    [applyDeviceToggles, showNotice]
   );
 
   const setMicEnabled = useCallback(
@@ -808,15 +759,24 @@ export function useRandomChat() {
   );
 
   const stopLocalStream = useCallback(() => {
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((t) => {
+    const stopAll = (tracks: MediaStreamTrack[]) => {
+      tracks.forEach((t) => {
         try {
           t.stop();
         } catch {
           /* noop */
         }
       });
+    };
+    if (localStreamRef.current) {
+      stopAll(localStreamRef.current.getTracks());
       localStreamRef.current = null;
+    }
+    // The peer original is a separate object from the preview clone —
+    // stopping only the preview would leave the camera light on.
+    if (peerVideoTrackRef.current) {
+      stopAll([peerVideoTrackRef.current]);
+      peerVideoTrackRef.current = null;
     }
     if (mountedRef.current) setLocalStream(null);
   }, []);
@@ -857,7 +817,8 @@ export function useRandomChat() {
   /**
    * Switch camera/mic, live if a stream is active (sender.replaceTrack, no
    * renegotiation) or stored as preference for the next acquire when idle
-   * (e.g. picked from the busy dialog before retrying).
+   * (e.g. picked from the busy dialog before retrying). Video swaps the
+   * peer-bound original; the preview keeps its own live clone.
    */
   const switchDevice = useCallback(
     async (kind: "video" | "audio", deviceId: string): Promise<boolean> => {
@@ -884,39 +845,76 @@ export function useRandomChat() {
           });
           return false;
         }
-        const olds =
-          kind === "video" ? cur.getVideoTracks() : cur.getAudioTracks();
-        const pc = peerRef.current;
-        if (pc) {
-          for (const sender of pc.getSenders()) {
-            if (sender.track && olds.includes(sender.track)) {
-              try {
-                await sender.replaceTrack(fresh);
-              } catch {
-                /* keep old track on failure */
+        if (kind === "video") {
+          const oldPeer = peerVideoTrackRef.current;
+          // New original starts dark unless the camera is on — switching
+          // must never leak real frames by itself.
+          fresh.enabled = cameraOnRef.current;
+          peerVideoTrackRef.current = fresh;
+          const pc = peerRef.current;
+          if (pc && oldPeer) {
+            for (const sender of pc.getSenders()) {
+              if (sender.track === oldPeer) {
+                try {
+                  await sender.replaceTrack(fresh);
+                } catch {
+                  /* keep old track on failure */
+                }
               }
             }
           }
+          if (oldPeer && oldPeer !== fresh) {
+            try {
+              oldPeer.stop();
+            } catch {
+              /* noop */
+            }
+          }
+          const oldClones = cur.getVideoTracks();
+          const clone = fresh.clone();
+          clone.enabled = true;
+          oldClones.forEach((t) => {
+            try {
+              t.stop();
+            } catch {
+              /* noop */
+            }
+            try {
+              cur.removeTrack(t);
+            } catch {
+              /* noop */
+            }
+          });
+          cur.addTrack(clone);
+        } else {
+          const olds = cur.getAudioTracks();
+          const pc = peerRef.current;
+          if (pc) {
+            for (const sender of pc.getSenders()) {
+              if (sender.track && olds.includes(sender.track)) {
+                try {
+                  await sender.replaceTrack(fresh);
+                } catch {
+                  /* keep old track on failure */
+                }
+              }
+            }
+          }
+          olds.forEach((t) => {
+            try {
+              t.stop();
+            } catch {
+              /* noop */
+            }
+            try {
+              cur.removeTrack(t);
+            } catch {
+              /* noop */
+            }
+          });
+          cur.addTrack(fresh);
         }
-        olds.forEach((t) => {
-          try {
-            t.stop();
-          } catch {
-            /* noop */
-          }
-          try {
-            cur.removeTrack(t);
-          } catch {
-            /* noop */
-          }
-        });
-        cur.addTrack(fresh);
         applyDeviceToggles(cur);
-        // A live swap replaces even a held (null) sender — re-hold when
-        // the camera is off so switching can't leak real frames.
-        if (kind === "video" && !cameraOnRef.current) {
-          await setPeerVideoSending(null, false);
-        }
         if (mountedRef.current) {
           setLocalStream(new MediaStream(cur.getTracks()));
           if (kind === "video") setActiveVideoDeviceId(deviceId);
@@ -928,7 +926,7 @@ export function useRandomChat() {
         return false;
       }
     },
-    [applyDeviceToggles, refreshDevices, setPeerVideoSending]
+    [applyDeviceToggles, refreshDevices]
   );
 
   // Keep the device pickers live as hardware is plugged/unplugged.
@@ -974,17 +972,32 @@ export function useRandomChat() {
     try {
       const preferredVideo = preferredVideoDeviceIdRef.current;
       const preferredAudio = preferredAudioDeviceIdRef.current;
-      const stream = await navigator.mediaDevices.getUserMedia({
+      const raw = await navigator.mediaDevices.getUserMedia({
         audio: preferredAudio ? { deviceId: { exact: preferredAudio } } : true,
         video: preferredVideo ? { deviceId: { exact: preferredVideo } } : true,
       });
+      const originalVideo = raw.getVideoTracks()[0] ?? null;
+      const audioTracks = raw.getAudioTracks();
       // Remember what the browser actually opened (labels/ids for pickers).
+      const vId = originalVideo?.getSettings().deviceId;
+      const aId = audioTracks[0]?.getSettings().deviceId;
+      // Peer-bound original starts DARK (black, never real pixels) until a
+      // face check explicitly lights it. Preview/detector run on a live
+      // clone underneath the "Camera off" overlay.
+      if (originalVideo) originalVideo.enabled = false;
+      peerVideoTrackRef.current = originalVideo;
+      const previewVideo = originalVideo ? originalVideo.clone() : null;
+      if (previewVideo) previewVideo.enabled = true;
+      const preview = new MediaStream([
+        ...(previewVideo ? [previewVideo] : []),
+        ...audioTracks,
+      ]);
       // Face-first: never publish video until a face is visible. Fail-open
       // when the detector can't load so the call still works.
-      if (cameraOnRef.current) {
+      if (cameraOnRef.current && previewVideo) {
         let face: boolean | null = null;
         try {
-          face = await checkFaceOnce(stream);
+          face = await checkFaceOnce(preview);
         } catch {
           face = null;
         }
@@ -1002,18 +1015,17 @@ export function useRandomChat() {
           }
         }
       }
-      applyDeviceToggles(stream);
-      localStreamRef.current = stream;
+      applyDeviceToggles(preview);
+      localStreamRef.current = preview;
       if (mountedRef.current) {
-        setLocalStream(stream);
-        const vId = stream.getVideoTracks()[0]?.getSettings().deviceId;
-        const aId = stream.getAudioTracks()[0]?.getSettings().deviceId;
+        setLocalStream(preview);
         if (typeof vId === "string") setActiveVideoDeviceId(vId);
         if (typeof aId === "string") setActiveAudioDeviceId(aId);
       }
       void refreshDevices();
-      return stream;
+      return preview;
     } catch (e) {
+      peerVideoTrackRef.current = null;
       throw e;
     }
   }, [applyDeviceToggles, stopLocalStream, showNotice, refreshDevices]);
@@ -1339,10 +1351,12 @@ export function useRandomChat() {
       }
     };
 
-    // Attach local tracks if the camera is already running.
+    // Attach local tracks: shared audio + the peer-bound video original
+    // (dark unless the camera is on and verified — black flows, never a
+    // frozen frame, no sender surgery needed).
     const local = localStreamRef.current;
     if (local) {
-      local.getTracks().forEach((track) => {
+      local.getAudioTracks().forEach((track) => {
         try {
           peerConnection.addTrack(track, local);
         } catch {
@@ -1350,32 +1364,14 @@ export function useRandomChat() {
         }
       });
     }
-
-    // Never publish video while the camera is off or unverified: hold the
-    // video sender until a face check explicitly resumes it. Awaited so
-    // the offer/answer that follows can only describe a held sender.
-    if (!cameraOnRef.current) {
-      const holds: Promise<void>[] = [];
-      peerConnection.getSenders().forEach((sender) => {
-        if (sender.track && sender.track.kind === "video") {
-          try {
-            const r = sender.replaceTrack(null) as unknown as
-              | Promise<void>
-              | undefined;
-            if (r && typeof r.then === "function") {
-              holds.push(
-                r.then(
-                  () => {},
-                  () => {}
-                )
-              );
-            }
-          } catch {
-            /* noop */
-          }
-        }
-      });
-      await Promise.all(holds);
+    const peerVideo = peerVideoTrackRef.current;
+    if (peerVideo && peerVideo.readyState === "live") {
+      try {
+        if (local) peerConnection.addTrack(peerVideo, local);
+        else peerConnection.addTrack(peerVideo);
+      } catch {
+        /* track may already be attached */
+      }
     }
 
     return peerConnection;
@@ -1403,19 +1399,9 @@ export function useRandomChat() {
       activeRoomRef.current = { roomId: null, ownerUid: null, joinedUid: null };
       if (mountedRef.current) setRole(null);
 
-      // Camera handling.
+      // Camera handling (peer original included — it outlives preview).
       if (!opts.keepCamera) {
-        if (localStreamRef.current) {
-          localStreamRef.current.getTracks().forEach((t) => {
-            try {
-              t.stop();
-            } catch {
-              /* noop */
-            }
-          });
-          localStreamRef.current = null;
-        }
-        if (mountedRef.current) setLocalStream(null);
+        stopLocalStream();
       }
 
       // Background Firestore cleanup (fire and forget).
@@ -1444,7 +1430,7 @@ export function useRandomChat() {
         guardTimerRef.current = null;
       }, 300);
     },
-    [clearAllTimers, clearGuardTimer, clearResweepTimer, teardownPeerSync, cleanupRemoteRoomData, deleteCollectionDocs]
+    [clearAllTimers, clearGuardTimer, clearResweepTimer, teardownPeerSync, cleanupRemoteRoomData, deleteCollectionDocs, stopLocalStream]
   );
 
   /* --------- Fresh-session retry on failure / timeout --------- */
@@ -1752,6 +1738,14 @@ export function useRandomChat() {
           }
         });
         localStreamRef.current = null;
+      }
+      if (peerVideoTrackRef.current) {
+        try {
+          peerVideoTrackRef.current.stop();
+        } catch {
+          /* noop */
+        }
+        peerVideoTrackRef.current = null;
       }
       const captured = {
         info: { ...roomInfoRef.current },
