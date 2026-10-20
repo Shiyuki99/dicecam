@@ -132,17 +132,21 @@ service cloud.firestore {
       allow read: if signedIn();
 
       // Own doc only: { state, lastSeen } with a server timestamp.
+      // lastSeen must be a server timestamp (small skew window allowed) so
+      // it cannot be forged to keep a dead session "online" forever.
       allow create: if signedIn()
         && uid == request.auth.uid
         && validState(request.resource.data.state)
-        && request.resource.data.lastSeen == request.time
+        && request.resource.data.lastSeen >= request.time - duration.value(10, 's')
+        && request.resource.data.lastSeen <= request.time + duration.value(10, 's')
         && request.resource.data.keys().hasOnly(['state', 'lastSeen']);
 
       allow update: if signedIn()
         && uid == request.auth.uid
         && validState(resource.data.state)
         && validState(request.resource.data.state)
-        && request.resource.data.lastSeen == request.time
+        && request.resource.data.lastSeen >= request.time - duration.value(10, 's')
+        && request.resource.data.lastSeen <= request.time + duration.value(10, 's')
         && request.resource.data.keys().hasOnly(['state', 'lastSeen']);
 
       // Own doc, or a dead one (janitor reaps tabs whose heartbeat
