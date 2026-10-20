@@ -12,6 +12,8 @@ production product.
 ## Features
 
 - **Random matching** — Start, Next Person (Shuffle), Disconnect/Stop.
+- **Live people counter** — a badge shows how many people are online right
+  now and how many are in a call (anonymous UUID presence + heartbeat).
 - **P2P video + audio** (WebRTC) with local preview once you press Start.
 - **Text chat** over a data channel once connected.
 - **Camera / mic toggles** on your preview — both off = text-only mode.
@@ -31,6 +33,10 @@ production product.
 - Calls are end-to-end, peer-to-peer. No personal data, footage, or messages
   are stored or processed — Firestore only holds ephemeral signaling docs
   (offers/answers/ICE) that are deleted on leave or swept when stale.
+- The **people-online counter** keeps one doc per browser: a random
+  anonymous Firebase UID, the user's state (idle / searching / connected)
+  and a heartbeat timestamp. No IP, no name, no account — the doc is
+  deleted when you leave and reaped if your tab dies.
 - Your **public IP is visible to the matched stranger** (STUN/WebRTC
   protocol). Use a VPN if you care.
 - Face detection runs 100% on-device; no video is sent anywhere for it.
@@ -49,6 +55,8 @@ Firebase Console → Project settings:
 | Variable | Purpose |
 |---|---|
 | `NEXT_PUBLIC_FIREBASE_*` | App keys, project ID, collection (`connections` default) |
+| `NEXT_PUBLIC_FIREBASE_PRESENCE_COLLECTION` | Presence collection (`presence` default) |
+| `NEXT_PUBLIC_FIREBASE_STATS_COLLECTION` | Counter collection (`presence_stats` default) |
 | `NEXT_PUBLIC_RECAPTCHA_SITE_KEY` | Optional. Only needed if you enforce App Check |
 | `NEXT_PUBLIC_FIREBASE_APPCHECK_DEBUG` | Localhost only (`true` prints a debug token) |
 
@@ -58,6 +66,9 @@ Firebase setup:
 2. **Firestore → Rules tab → paste `Next/firestore.rules` → Publish.**
    Scoped to the rooms collection + per-room ICE collections; anyone may
    delete docs idle past the stale threshold (the janitor depends on this).
+   The same file covers the presence tracker (`presence` +
+   `presence_stats`) — without it the counter stays offline and the badge
+   shows "—".
 3. One-time: wipe any pre-existing `connections` docs and stray
    `*caller`/`*callee` collections (old docs lack `createdAt`, nothing can
    match or reap them).
@@ -81,6 +92,14 @@ real app. (`Vanilla code/firestore.rules` is superseded by
 - The project began as a JavaScript-only WebRTC learning challenge
   (offer/answer, ICE, data channels, Firestore signaling), then was
   refactored to TypeScript with anonymous Firebase auth and a redesigned UI.
+- **People-online tracker** (`src/lib/presence.ts`): every browser owns one
+  `presence/<uid>` doc and refreshes it every 45s; the counters live in a
+  single `presence_stats/live` doc, so each client reads one doc instead of
+  one per online user. Dead tabs are reaped after 3 missed heartbeats, and
+  the counters are re-derived from scratch every 5 minutes as a self-heal.
+  Cost knobs (all in `src/lib/presence.ts`): `HEARTBEAT_MS` (one write per
+  user per tick — raise it if you hit the Firestore write quota),
+  `REAP_INTERVAL_MS`, `RECOMPUTE_MS`.
 - Fun-project scope: no TURN server (peer IPs visible, by design), no
   server-side moderation, no hard per-user throttling — a modded client can
   bypass the client-side gates. If strangers find the URL and abuse follows,

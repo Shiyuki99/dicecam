@@ -16,12 +16,9 @@ import {
   type DocumentData,
   type QueryDocumentSnapshot,
 } from "firebase/firestore";
-import {
-  signInAnonymously,
-  onAuthStateChanged,
-  type User,
-} from "firebase/auth";
+import { type User } from "firebase/auth";
 import { getFirebase, CONNECTIONS_COLLECTION } from "@/lib/firebase";
+import { ensureAnonymousAuth as ensureSharedAuth } from "@/lib/auth";
 import { checkFaceOnce } from "./use-face-gate";
 
 export type ChatStatus = "idle" | "searching" | "connected" | "peer-left";
@@ -651,28 +648,12 @@ export function useRandomChat() {
   );
 
   /* ----------------------------- Firebase auth ---------------------------- */
+  // Shared with the presence tracker so both use the same anonymous UID.
   const ensureAnonymousAuth = useCallback(async () => {
     if (authReadyRef.current && userRef.current) return userRef.current;
-    const { auth } = getFirebase();
-    if (!auth) throw new Error("Firebase not available on the server.");
-    await signInAnonymously(auth);
-    const user = await new Promise<User>((resolve, reject) => {
-      const unsubscribe = onAuthStateChanged(
-        auth,
-        (u) => {
-          if (u) {
-            userRef.current = u;
-            authReadyRef.current = true;
-            unsubscribe();
-            resolve(u);
-          }
-        },
-        (err) => {
-          unsubscribe();
-          reject(err);
-        }
-      );
-    });
+    const user = await ensureSharedAuth();
+    userRef.current = user;
+    authReadyRef.current = true;
     return user;
   }, []);
 

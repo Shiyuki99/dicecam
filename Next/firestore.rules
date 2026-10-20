@@ -117,5 +117,62 @@ service cloud.firestore {
           || (resource.data.keys().hasAll(['roomId'])
             && !exists(/databases/$(database)/documents/connections/$(resource.data.roomId))));
     }
+    /* ------------------------- Presence tracker ---------------------------- */
+    // Online-people tracker. One doc per anonymous user (doc id = the
+    // Firebase anonymous UID): { state, lastSeen }. `presence_stats/live`
+    // holds the aggregated counters (online / inCall / calls) every client
+    // renders.
+    // If you changed NEXT_PUBLIC_FIREBASE_PRESENCE_COLLECTION, rename the
+    // `presence` match below to the same value.
+    match /presence/{uid} {
+      function validState(s) {
+        return s in ['idle', 'searching', 'connected', 'peer-left'];
+      }
+
+      allow read: if signedIn();
+
+      // Own doc only: { state, lastSeen } with a server timestamp.
+      allow create: if signedIn()
+        && uid == request.auth.uid
+        && validState(request.resource.data.state)
+        && request.resource.data.lastSeen == request.time
+        && request.resource.data.keys().hasOnly(['state', 'lastSeen']);
+
+      allow update: if signedIn()
+        && uid == request.auth.uid
+        && validState(resource.data.state)
+        && validState(request.resource.data.state)
+        && request.resource.data.lastSeen == request.time
+        && request.resource.data.keys().hasOnly(['state', 'lastSeen']);
+
+      // Own doc, or a dead one (janitor reaps tabs whose heartbeat
+      // stopped — crashed, killed, closed laptop).
+      allow delete: if signedIn()
+        && (uid == request.auth.uid
+          || resource.data.lastSeen < request.time - duration.value(2, 'm'));
+    }
+
+    // Aggregated counters. Clients patch them transactionally, so the
+    // values are clamped to sane integers and `calls` only ever grows.
+    match /presence_stats/{docId} {
+      function counterShape(d) {
+        return d.keys().hasOnly(
+               ['online', 'inCall', 'calls', 'updatedAt', 'recomputedAt'])
+          && d.online is int && d.online >= 0 && d.online <= 100000
+          && d.inCall is int && d.inCall >= 0 && d.inCall <= 100000
+          && d.calls is int && d.calls >= 0 && d.calls <= 100000000
+          && d.updatedAt == request.time;
+      }
+
+      allow read: if signedIn();
+
+      allow create: if signedIn() && counterShape(request.resource.data);
+
+      allow update: if signedIn()
+        && counterShape(request.resource.data)
+        && request.resource.data.calls >= resource.data.calls;
+
+      allow delete: if false;
+    }
   }
 }

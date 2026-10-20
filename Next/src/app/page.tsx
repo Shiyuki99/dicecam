@@ -37,11 +37,14 @@ import {
   type ChatStatus,
 } from "@/hooks/use-random-chat";
 import { useFaceGate } from "@/hooks/use-face-gate";
+import { usePresence } from "@/hooks/use-presence";
 
 const GITHUB_URL = "https://github.com/Shiyuki99/dicecam";
 
 export default function Home() {
   const chat = useRandomChat();
+  // Live people-online tracker (presence collection + aggregated counters).
+  const presence = usePresence(chat.status);
   // Populate the device pickers whenever the permission dialog opens.
   useEffect(() => {
     if (chat.permissionError) void chat.refreshDevices();
@@ -58,8 +61,8 @@ export default function Home() {
         }}
       />
 
-      <DesktopView chat={chat} />
-      <MobileView chat={chat} />
+      <DesktopView chat={chat} presence={presence} />
+      <MobileView chat={chat} presence={presence} />
 
       {/* Permission dialog: camera/mic blocked, with re-prompt */}
       <Dialog
@@ -304,6 +307,49 @@ function StatusPill({
   );
 }
 
+/* ------------------------------------------------------------------ */
+/* Live people-online tracker                                          */
+/* ------------------------------------------------------------------ */
+
+type PresenceStats = {
+  online: number;
+  inCall: number;
+  calls: number;
+  tracking: boolean;
+};
+
+function PresenceBadge({
+  presence,
+  compact,
+}: {
+  presence: PresenceStats;
+  compact?: boolean;
+}) {
+  const { online, inCall, calls, tracking } = presence;
+  const label = tracking ? `${online} online` : "—";
+  return (
+    <div
+      className={`flex items-center gap-1.5 rounded-full border border-white/10 bg-white/5 font-medium text-zinc-300 ${
+        compact ? "px-2.5 py-1 text-[11px]" : "px-3 py-1.5 text-xs"
+      }`}
+      title={
+        tracking
+          ? `${online} online · ${inCall} in a call · ${calls} calls made`
+          : "Tracker offline"
+      }
+    >
+      <span className="relative flex size-2">
+        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />
+        <span className="relative inline-flex size-2 rounded-full bg-emerald-400" />
+      </span>
+      {label}
+      {!compact && tracking && (
+        <span className="text-zinc-500">· {inCall} in call</span>
+      )}
+    </div>
+  );
+}
+
 function RemoteOverlay({
   status,
   hasRemote,
@@ -426,6 +472,10 @@ function DisclaimerDialog() {
           <li>
             No personal data, info, or footage is stored or processed —
             connections are end-to-end, peer-to-peer.
+          </li>
+          <li>
+            For the &quot;people online&quot; counter we keep one random
+            anonymous ID plus a timestamp; it&apos;s deleted when you leave.
           </li>
           <li>
             Your public IP is exposed by the STUN/WebRTC protocol — use a VPN
@@ -706,7 +756,13 @@ function DeviceToggles({
 /* Desktop (unchanged sidebar layout)                                  */
 /* ------------------------------------------------------------------ */
 
-function DesktopView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
+function DesktopView({
+  chat,
+  presence,
+}: {
+  chat: ReturnType<typeof useRandomChat>;
+  presence: PresenceStats;
+}) {
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -848,6 +904,7 @@ function DesktopView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
             <Github className="size-4" />
           </a>
           <StatusPill status={chat.status} channelOpen={chat.channelOpen} />
+          <PresenceBadge presence={presence} />
         </div>
       </header>
 
@@ -1019,7 +1076,13 @@ function DesktopView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
 /* Mobile (new single-screen layout)                                   */
 /* ------------------------------------------------------------------ */
 
-function MobileView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
+function MobileView({
+  chat,
+  presence,
+}: {
+  chat: ReturnType<typeof useRandomChat>;
+  presence: PresenceStats;
+}) {
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -1206,6 +1269,7 @@ function MobileView({ chat }: { chat: ReturnType<typeof useRandomChat> }) {
               </span>
               {c.label}
             </div>
+            <PresenceBadge presence={presence} compact />
             <a
               href={GITHUB_URL}
               target="_blank"
